@@ -359,10 +359,9 @@ export class Library {
     }
   }
 
-  async list(search: string, wanted: string[], mode: 'all' | 'any', trashed = false, page = 0) {
+  private async findTemplates(search: string, wanted: string[], mode: 'all' | 'any', trashed: boolean, limit: number, offset: number) {
     const tags = [...new Set(wanted.map(tagKey).filter(Boolean))];
     const started = performance.now();
-    const pageSize = 500;
     const {rows} = await this.pool.query(`${selectSummary} FROM vfx_templates t
       WHERE (t.deleted_at IS NOT NULL) = $4::boolean
       AND ($1 = '' OR position(lower($1) in lower(t.title)) > 0 OR EXISTS (
@@ -373,7 +372,27 @@ export class Library {
         (SELECT count(*) FROM vfx_template_tags tt WHERE tt.template_id=t.id AND tt.tag_key=ANY($2::text[])) >=
           CASE WHEN $3='all' THEN cardinality($2::text[]) ELSE 1 END)
       ORDER BY COALESCE(t.deleted_at,t.created_at) DESC,t.id DESC LIMIT $6 OFFSET $7`,
-      [search.trim(),tags,mode,trashed,tagKey(search),trashed ? pageSize+1 : pageSize,trashed ? page*pageSize : 0]);
+      [search.trim(),tags,mode,trashed,tagKey(search),limit,offset]);
+    this.log.info({module:'search',filters:tags.length,mode,trashed,matches:rows.length,elapsedMs:Math.round(performance.now()-started)},'templates.listed');
+    return rows.map(row=>({...row,bytes:Number(row.bytes)})) as Template[];
+  }
+
+  async searchPublished(search: string, limit: number, offset: number) {
+    const items = await this.findTemplates(search,[],'any',false,limit+1,offset);
+    return {
+      source:'vfx-template-library',
+      items:items.slice(0,limit).map(({id,title,tags,files,bytes,publishedAt})=>({id,title,tags,files,bytes,publishedAt})),
+      nextOffset:items.length>limit ? offset+limit : null,
+    };
+  }
+
+  async catalogReady() {
+    return this.pool.query('SELECT 1').then(()=>true,()=>false);
+  }
+
+  async list(search: string, wanted: string[], mode: 'all' | 'any', trashed = false, page = 0) {
+    const pageSize = 500;
+    const items = await this.findTemplates(search,wanted,mode,trashed,trashed?pageSize+1:pageSize,trashed?page*pageSize:0);
     const available = await this.pool.query(`
       SELECT g.name FROM vfx_tags g
       WHERE EXISTS (
@@ -382,9 +401,7 @@ export class Library {
       )
       ORDER BY g.name
     `);
-    this.log.info({module:'search',filters:tags.length,mode,trashed,matches:rows.length,elapsedMs:Math.round(performance.now()-started)},'templates.listed');
-    return {items:rows.slice(0,pageSize).map(row => ({...row,bytes:Number(row.bytes)})) as Template[],
-      tags:available.rows.map(row => row.name as string),hasNext:rows.length>pageSize};
+    return {items:items.slice(0,pageSize),tags:available.rows.map(row=>row.name as string),hasNext:items.length>pageSize};
   }
 
   async detail(id: string): Promise<TemplateDetail> {

@@ -15,13 +15,15 @@ const shortString = {type:'string',minLength:1,maxLength:100};
 const tags = {type:'array',maxItems:100,items:shortString};
 const invalidBackupDirectory = (directory:string) => Boolean(directory) && !path.isAbsolute(directory);
 const backupDirectoryError = '请选择绝对路径的备份目录';
+const catalogRoute = '/integrations/fx-agent/templates';
+const catalogStatusRoute = '/integrations/fx-agent/status';
 const idParams = {type:'object',required:['id'],properties:{id:uuid}};
 const allRequired = (properties:Record<string,unknown>) => ({
   type:'object',required:Object.keys(properties),properties,additionalProperties:false,
 });
 
 export function createServer(options: {
-  token:string; logPath:string;
+  token:string; logPath:string; catalogToken?:string;
   loadSettings:()=>Promise<Settings | undefined>;
   saveSettings:(s:Settings)=>Promise<void>;
   progress:(event:ArchiveProgress)=>void;
@@ -36,7 +38,11 @@ export function createServer(options: {
   let warning: string | undefined;
   let configuring = false;
   app.addHook('onRequest',async (request,reply) => {
-    if (request.headers.authorization !== `Bearer ${options.token}`) {
+    const authorization = request.headers.authorization;
+    const route = request.routeOptions.url;
+    const catalogRead = request.method === 'GET' && (route === catalogRoute || route === catalogStatusRoute) &&
+      options.catalogToken && authorization === `Bearer ${options.catalogToken}`;
+    if (authorization !== `Bearer ${options.token}` && !catalogRead) {
       await reply.code(401).send({message:'未授权的本机请求'});
     }
   });
@@ -115,6 +121,19 @@ export function createServer(options: {
     properties:{search:{type:'string',maxLength:100},tags,mode:{enum:['all','any']},trashed:{type:'boolean'},
       page:{type:'integer',minimum:0,maximum:2147483647}},
   }}},async request => active().list(request.body.search,request.body.tags,request.body.mode,request.body.trashed,request.body.page));
+  app.get(catalogStatusRoute,async (_request,reply) => {
+    void reply.header('cache-control','no-store');
+    return {source:'vfx-template-library',ready:library ? await library.catalogReady() : false};
+  });
+  app.get<{Querystring:{query?:string;offset?:number;limit?:number}}>(catalogRoute,{schema:{querystring:{
+    type:'object',additionalProperties:false,
+    properties:{query:{type:'string',maxLength:100},offset:{type:'integer',minimum:0,maximum:2147483647},
+      limit:{type:'integer',minimum:1,maximum:25}},
+  }}},async (request,reply) => {
+    const {query='',offset=0,limit=10} = request.query;
+    void reply.header('cache-control','no-store');
+    return active().searchPublished(query,limit,offset);
+  });
   app.get<{Params:{id:string}}>('/templates/:id',{schema:{params:idParams}},async request => active().detail(request.params.id));
   app.get<{Params:{id:string}}>('/templates/:id/directory',{schema:{params:idParams}},async request => {
     const library = active();

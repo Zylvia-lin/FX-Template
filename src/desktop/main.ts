@@ -27,11 +27,13 @@ async function start() {
   const logDirectory = path.join(statePath,'logs');
   const logPath = path.join(logDirectory,`application-${new Date().toISOString().slice(0,10)}.jsonl`);
   const settingsFile = path.join(statePath,'settings.json');
+  const catalogFile = path.join(statePath,'fx-agent-catalog.json');
+  const catalogToken = randomUUID()+randomUUID();
   const catalogFilters = createCatalogFilterStore(path.join(statePath,'catalog-filters.json'));
   await mkdir(logDirectory,{recursive:true});
   let window: BrowserWindow | undefined;
   const service = createServer({
-    token,logPath,
+    token,logPath,catalogToken,
     async loadSettings() {
       try {
         const config = JSON.parse(await readFile(settingsFile,'utf8')) as Settings;
@@ -51,6 +53,9 @@ async function start() {
   });
   const origin = await service.app.listen({host:'127.0.0.1',port:0});
   await service.initialize();
+  await writeJson(catalogFile,{port:Number(new URL(origin).port),token:catalogToken}).catch(error=>{
+    service.app.log.warn({module:'fx-agent',errorCode:(error as NodeJS.ErrnoException).code},'catalog.connection_file_write_failed');
+  });
   service.app.log.info({module:'desktop',version:app.getVersion()},'desktop.started');
   const abort = new AbortController();
   const access = async (route: string,method='GET',body?:unknown, signal: AbortSignal = abort.signal) => {

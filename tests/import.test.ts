@@ -149,11 +149,18 @@ test('PostgreSQL 导入、同名隔离、标签、范围预览、打包与数据
   let stored:Settings|undefined;
   const progress:ArchiveProgress[] = [];
   const logPath = path.join(base,'operations.jsonl');
-  const service = server = createServer({token,logPath,loadSettings:async()=>stored,saveSettings:async s=>{stored=s;},progress:event=>progress.push(event)});
+  const catalogToken = 'catalog-test';
+  const service = server = createServer({token,logPath,catalogToken,loadSettings:async()=>stored,saveSettings:async s=>{stored=s;},progress:event=>progress.push(event)});
   await service.initialize();
   const request = (method:'GET'|'POST'|'PUT'|'DELETE',url:string,payload?:object,headers?:object) =>
     service.app.inject({method,url,payload,headers:{authorization:`Bearer ${token}`,...headers}});
+  const catalog = (url:string,method:'GET'|'DELETE' = 'GET') =>
+    service.app.inject({method,url,headers:{authorization:`Bearer ${catalogToken}`}});
+  const catalogStatus = '/integrations/fx-agent/status';
+  const catalogSearch = '/integrations/fx-agent/templates';
   assert.equal((await service.app.inject('/settings')).statusCode,401);
+  assert.equal((await service.app.inject(catalogStatus)).statusCode,401);
+  assert.deepEqual((await catalog(catalogStatus)).json(),{source:'vfx-template-library',ready:false});
   const restricted = await request('PUT','/settings',{...settings,user:restrictedRole});
   assert.equal(restricted.statusCode,400);
   assert.match(restricted.json().message,/没有创建数据库.*的权限/);
@@ -163,6 +170,7 @@ test('PostgreSQL 导入、同名隔离、标签、范围预览、打包与数据
   assert.equal((await pgClient.query('SELECT 1 FROM pg_database WHERE datname=$1',[database])).rowCount,0);
   const response = await request('PUT','/settings',settings);
   assert.equal(response.statusCode,200,response.body);
+  assert.equal((await catalog(catalogStatus)).json().ready,true);
   const relativeBackup = await request('PUT','/settings',{...settings,backupDirectory:'relative-backups'});
   assert.equal(relativeBackup.statusCode,400);
   assert.equal(stored?.backupDirectory,settings.backupDirectory);
@@ -203,6 +211,20 @@ test('PostgreSQL 导入、同名隔离、标签、范围预览、打包与数据
     ids.push(result.json().id);
   }
   assert.notEqual(ids[0],ids[1]);
+  const found = await catalog(catalogSearch+'?query='+encodeURIComponent('烟尘'));
+  assert.equal(found.statusCode,200,found.body);
+  const published = found.json();
+  assert.equal(published.source,'vfx-template-library');
+  assert.deepEqual(published.items.map((item:Template)=>item.id),[ids[0]]);
+  assert.deepEqual(Object.keys(published.items[0]).sort(),['bytes','files','id','publishedAt','tags','title']);
+  assert.equal(published.nextOffset,null);
+  const page = (await catalog(catalogSearch+'?limit=1')).json();
+  assert.equal(page.nextOffset,1);
+  const nextPage = (await catalog(catalogSearch+'?limit=1&offset='+page.nextOffset)).json();
+  assert.notEqual(nextPage.items[0].id,page.items[0].id);
+  assert.equal(nextPage.nextOffset,null);
+  assert.equal((await catalog('/settings')).statusCode,401);
+  assert.equal((await catalog(`/templates/${ids[0]}`,'DELETE')).statusCode,401);
   const project = path.join(root,'templates',ids[0],publishedVersion,'project');
   const directory = await request('GET',`/templates/${ids[0]}/directory`);
   assert.equal(directory.statusCode,200,directory.body);
@@ -256,6 +278,7 @@ test('PostgreSQL 导入、同名隔离、标签、范围预览、打包与数据
   assert.ok(!afterEdit.tags.includes('烟尘'));
   assert.equal((await search('烟')).json().items.length,0);
   assert.equal((await request('DELETE',`/templates/${ids[0]}`)).statusCode,200);
+  assert.deepEqual((await catalog(catalogSearch+'?query='+encodeURIComponent('重新分类'))).json().items,[]);
   const afterTrash = (await request('POST','/library',updated)).json();
   assert.equal(afterTrash.items.length,0);
   assert.ok(!afterTrash.tags.includes('重新分类'));
