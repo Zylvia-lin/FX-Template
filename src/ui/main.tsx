@@ -155,9 +155,22 @@ function App() {
     await api.configure(settings);
     setStatus(await api.status());setPanel('library');setNotice('配置已保存');
   });
+  const migrateStorage = (root:string) => action('正在复制并校验素材库，请保持应用运行',async()=>{
+    await api.migrateStorage(root);
+    setStatus(await api.status());
+    setSelected(undefined);
+    setNotice('素材库已切换到新目录');
+  });
   const backup = () => action('正在备份数据库',async()=>{
     const result = await api.backup();
     setNotice(`数据库备份完成 · ${bytes(result.bytes)} · ${result.file}`);
+  });
+  const restoreDatabase = () => action('正在选择备份或增量恢复，请保持应用运行',async()=>{
+    const result = await api.restoreDatabase();
+    if (!result) return;
+    setRevision(value=>value+1);
+    setNotice(`数据库恢复完成 · 新增 ${result.imported} · 已有 ID ${result.skipped} · 素材未就绪 ${result.unavailable}` +
+      (result.unavailable ? '。将对应素材拷贝到当前库后，可再次恢复。' : ''));
   });
   const restore = (id:string) => action('正在恢复模板',async()=>{
     await api.restore(id);
@@ -213,7 +226,8 @@ function App() {
         ? <ArchiveStatus progress={progress}/>
         : <div className="busy" role="status">{busy}</div>)}
       {settingsOpen&&<SettingsView key={String(status?.configured)} initial={{...defaults,...status?.settings}} warning={status?.warning}
-        working={Boolean(busy)} connected={Boolean(status?.configured)} save={save} backup={backup}/>}
+        working={Boolean(busy)} connected={Boolean(status?.configured)} save={save} backup={backup}
+        migrate={migrateStorage} restoreDatabase={restoreDatabase}/>}
       {!settingsOpen&&plan&&<ImportView plan={plan} working={Boolean(busy)} close={()=>setPlan(undefined)}
         addFolders={()=>void importPaths(()=>api.pickDirectories(),true)}
         addFiles={()=>void importPaths(()=>api.pickSource(),true)}
@@ -371,24 +385,45 @@ function ArchiveStatus({progress}: {progress:ArchiveProgress}) {
   </section>;
 }
 
-function SettingsView({initial,working,connected,warning,save,backup}:{
+function SettingsView({initial,working,connected,warning,save,backup,migrate,restoreDatabase}:{
   initial:Settings;working:boolean;connected:boolean;warning?:string;save:(value:Settings)=>void;backup:()=>void;
+  migrate:(root:string)=>void;
+  restoreDatabase:()=>void;
 }) {
   const [settings,setSettings] = useState(initial);
   const [folderError,setFolderError] = useState('');
+  const [destination,setDestination] = useState<{source:string;root:string}>();
+  const migrationRoot = destination?.source===initial.root ? destination.root : undefined;
   const update = <K extends keyof Settings>(key:K,value:Settings[K])=>setSettings(old=>({...old,[key]:value}));
-  async function choose(key:'root'|'backupDirectory') {
+  async function choose(key:'root'|'backupDirectory'|'migration') {
     setFolderError('');
-    try {const value=await api.pickDirectory();if(value)update(key,value);}
+    try {
+      const value = await api.pickDirectory();
+      if (!value) return;
+      if (key==='migration') setDestination({source:initial.root,root:value});
+      else update(key,value);
+    }
     catch(error){setFolderError(errorText(error));}
   }
-  return <form className="settings content" onSubmit={event=>{event.preventDefault();save(settings);}}>
+  return <form className="settings content" onSubmit={event=>{
+    event.preventDefault();
+    if (!working) save({...settings,root:connected?initial.root:settings.root});
+  }}>
     {!connected&&<><h1>连接你的本地模板库</h1><p className="muted">选择素材目录和 PostgreSQL 专用库。如果库还未创建，有建库权限的账号可以直接初始化。</p></>}
     {warning&&<p role="alert" className="warning">{warning}</p>}
     {folderError&&<p role="alert" className="warning">{folderError}</p>}
     <section><h2>素材存储</h2><label htmlFor="root">库目录</label><div className="field-row">
-      <input id="root" required value={settings.root} onChange={e=>update('root',e.target.value)} readOnly={connected} placeholder="例如 D:\特效模板库"/>
-      <button type="button" disabled={working||connected} onClick={()=>void choose('root')}>选择目录</button></div></section>
+      <input id="root" required value={connected?initial.root:settings.root} onChange={e=>update('root',e.target.value)} readOnly={connected} placeholder="例如 D:\特效模板库"/>
+      <button type="button" disabled={working} onClick={()=>void choose(connected?'migration':'root')}>{connected?'修改存储路径':'选择目录'}</button></div>
+      {migrationRoot&&<>
+        <p>新目录 <strong>{migrationRoot}</strong></p>
+        <p className="muted">请选择空目录。校验完成后将切换素材库，原文件会保留。迁移前请退出使用原库的其他客户端。</p>
+        <div className="toolbar">
+          <button className="primary" type="button" disabled={working} onClick={()=>migrate(migrationRoot)}>复制并切换</button>
+          <button type="button" disabled={working} onClick={()=>setDestination(undefined)}>取消</button>
+        </div>
+      </>}
+    </section>
     <section><h2>PostgreSQL</h2><div className="form-grid">
       <label>主机<input required readOnly={connected} value={settings.host} onChange={e=>update('host',e.target.value)}/></label>
       <label>端口<input required readOnly={connected} type="number" min="1" max="65535" value={settings.port} onChange={e=>update('port',Number(e.target.value))}/></label>
@@ -403,6 +438,10 @@ function SettingsView({initial,working,connected,warning,save,backup}:{
         <label>每天执行时间<input type="time" value={settings.backupTime} onChange={e=>update('backupTime',e.target.value)}/></label>
         <label>保留份数<input required type="number" min="1" max="365" value={settings.backupRetention} onChange={e=>update('backupRetention',Number(e.target.value))}/></label>
       </div>
+      {connected&&<>
+        <p className="muted">增量恢复只导入新 ID。请先将对应素材复制到当前库的 templates 目录。</p>
+        <button type="button" disabled={working} onClick={restoreDatabase}>从备份增量恢复</button>
+      </>}
     </section>
     <div className="toolbar"><button className="primary" type="submit" disabled={working}>{connected?'保存设置':'连接并初始化'}</button>
       {connected&&<button type="button" disabled={working||!initial.backupDirectory} onClick={backup}>立即备份</button>}</div>

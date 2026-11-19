@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, rmdir, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
@@ -8,6 +8,7 @@ import pg from 'pg';
 import type { FastifyBaseLogger } from 'fastify';
 import type { ArchiveProgress, Plan, PublishInput, Settings, Template, TemplateDetail } from '../contracts';
 import { nativePath, scanSources, sequencesFor } from './scanner';
+import { restoreDatabaseBackup } from './restore';
 
 const schema = `
   CREATE TABLE IF NOT EXISTS vfx_library (
@@ -154,13 +155,90 @@ const selectSummary = `
 const importVersion = /^\.import-([a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})\.json$/u;
 const lockKey = 'hashtextextended($1,0)';
 
+function containsDirectory(parent:string, child:string) {
+  const relative = path.relative(parent,child);
+  return relative === '' || (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith('..'+path.sep));
+}
+
 export class Library {
   private plans = new Map<string, Plan>();
   private publishing = new Set<string>();
 
-  constructor(private pool: pg.Pool, readonly root: string, readonly id: string, private log: FastifyBaseLogger) {}
+  constructor(private pool: pg.Pool, private directory: string, readonly id: string, private log: FastifyBaseLogger) {}
+
+  get root() { return this.directory; }
 
   close() { return this.pool.end(); }
+
+  restoreDatabase(file:string) { return restoreDatabaseBackup(this.pool,this.root,file,this.log); }
+
+  async migrateStorage(requested:string, saveRoot:(root:string)=>Promise<void>) {
+    const root = path.normalize(requested);
+    if (!path.isAbsolute(root) || path.parse(root).root === root) throw new Error('请选择专用的素材库目录');
+    const parent = await realpath(path.dirname(root)).catch(error=>{
+      if (error.code === 'ENOENT') throw new Error('找不到新目录的上级目录，请检查存储盘是否已连接');
+      throw error;
+    });
+    const target = path.join(parent,path.basename(root));
+    const info = await lstat(target).catch(error=>{
+      if (error.code === 'ENOENT') return undefined;
+      throw error;
+    });
+    const resolvedTarget = info ? await realpath(target) : target;
+    if (containsDirectory(this.root,resolvedTarget) || containsDirectory(resolvedTarget,this.root)) {
+      throw new Error('新目录不能与当前素材库相同，也不能互相包含');
+    }
+    if (info && (!info.isDirectory() || (await readdir(target)).length)) throw new Error('请选择空目录或尚未创建的目录');
+
+    const temporary = await mkdtemp(path.join(parent,'.vfx-migration-'));
+    const copy = path.join(temporary,'library');
+    const log = this.log.child({module:'migration',source:this.root,target});
+    let removedEmpty = false;
+    let promoted = false;
+    log.info('storage.migration_started');
+    try {
+      await cp(this.root,copy,{recursive:true,force:false,errorOnExist:true,filter:async source=>{
+        const entry = await lstat(source);
+        if (!entry.isDirectory() && !entry.isFile()) throw new Error(`素材库含有链接或特殊文件：${path.relative(this.root,source)}`);
+        return true;
+      }});
+      const marker = await readFile(path.join(copy,'.vfx-library'),'utf8');
+      if (marker.trim() !== this.id) throw new Error('复制后的素材库与数据库不匹配');
+      const {rows} = await this.pool.query<Pick<TemplateDetail,'id'|'version'|'manifest'>>('SELECT id,version,manifest FROM vfx_templates');
+      for (const template of rows) {
+        const project = path.join(copy,'templates',template.id,template.version,'project');
+        for (const file of template.manifest) {
+          const hash = createHash('sha256');
+          for await (const chunk of createReadStream(nativePath(project,file.path))) hash.update(chunk);
+          if (hash.digest('hex') !== file.sha256) throw new Error(`复制后的素材校验失败：${file.path}`);
+        }
+      }
+
+      if (info) {
+        await rmdir(target);
+        removedEmpty = true;
+      }
+      await rename(copy,target);
+      promoted = true;
+      await saveRoot(root);
+      this.directory = target;
+      this.plans.clear();
+      log.info('storage.migration_completed');
+    } catch (error) {
+      log.warn(errorFields(error),'storage.migration_failed');
+      if (promoted) {
+        await rename(target,copy).then(()=>{promoted=false;},cleanupError=>{
+          log.warn(errorFields(cleanupError),'storage.migration_rollback_failed');
+        });
+      }
+      if (removedEmpty && !promoted) {
+        await mkdir(target).catch(cleanupError=>log.warn(errorFields(cleanupError),'storage.migration_restore_directory_failed'));
+      }
+      throw error;
+    } finally {
+      await rm(temporary,{recursive:true,force:true}).catch(error=>log.warn(errorFields(error),'storage.migration_cleanup_failed'));
+    }
+  }
 
   async recoverImports() {
     const staging = path.join(this.root,'staging');

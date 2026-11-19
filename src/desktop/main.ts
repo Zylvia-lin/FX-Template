@@ -119,6 +119,24 @@ async function start() {
       return {ok:false,message:(error as Error).message};
     }
   });
+  let libraryMaintenance:Promise<unknown> | undefined;
+  const maintenance = async (url:string,payload:object) => {
+    if (libraryMaintenance) return {ok:false,message:'素材库维护操作正在运行'};
+    // Library maintenance can take longer than the HTTP header timeout.
+    libraryMaintenance = service.app.inject({
+      method:'POST',url,headers:{authorization:`Bearer ${token}`},payload,
+    }).then(response=>response.json());
+    try { return await libraryMaintenance; }
+    finally { libraryMaintenance = undefined; }
+  };
+  handle('migrate-storage',(root:string)=>maintenance('/settings/migrate-storage',{root}));
+  handle('restore-database',async ()=>{
+    const {filePaths:[file]} = await dialog.showOpenDialog(window!,{
+      title:'选择要增量恢复的数据库备份',properties:['openFile'],
+      filters:[{name:'特效模板库数据库备份',extensions:['dump']}],
+    });
+    if (file) return maintenance('/backup/restore',{file});
+  });
   handle('directory',async () => (await dialog.showOpenDialog(window!,{properties:['openDirectory','createDirectory']})).filePaths[0]);
   handle('import-directories',async () => (await dialog.showOpenDialog(window!,{
     properties:['openDirectory','multiSelections'],
@@ -213,7 +231,7 @@ async function start() {
   }
   app.on('second-instance',()=>{window?.show();window?.focus();});
   app.on('before-quit',event => {
-    const pending = catalogFilters.pendingWrite();
+    const pending = libraryMaintenance ?? catalogFilters.pendingWrite();
     if (pending) {
       event.preventDefault();
       void pending.then(()=>app.quit(),()=>app.quit());

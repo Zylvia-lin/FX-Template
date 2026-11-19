@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, readdir, realpath, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, readdir, realpath, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { test } from 'node:test';
@@ -59,6 +59,92 @@ test('按项目组织混合素材，选择预览并区分 UDIM 与帧序列',asy
   for (const invalid of ['../bad','.git/../bad','a\\..\\b','foo/C:stream','aux.txt','name.']) {
     assert.throws(()=>nativePath(root,invalid),/路径/);
   }
+});
+
+test('两套独立数据库通过备份双向合并新 ID，缺少素材可重试', {skip:!process.env.VFX_TEST_PG_PORT}, async t=>{
+  const {base,source} = await fixture();
+  const port = Number(process.env.VFX_TEST_PG_PORT);
+  const admin = new pg.Client({host:'127.0.0.1',port,user:'vfx_test',database:'postgres'});
+  await admin.connect();
+  const token = 'restore-test';
+  const names = ['a','b'].map(name=>`vfx_merge_${name}_${randomUUID().replaceAll('-','')}`);
+  const devices = names.map((database,index)=>{
+    const root = path.join(base,`library-${index}`);
+    const settings = {root,database,host:'127.0.0.1',port,user:'vfx_test',password:'',
+      backupDirectory:path.join(base,`backup-${index}`),backupTime:'',backupRetention:2};
+    const service = createServer({token,logPath:path.join(base,`restore-${index}.log`),
+      loadSettings:async()=>undefined,saveSettings:async()=>undefined,progress:()=>undefined});
+    const request = (method:'GET'|'PUT'|'POST'|'DELETE',url:string,payload?:object,extraHeaders?:object) =>
+      service.app.inject({method,url,payload,headers:{authorization:`Bearer ${token}`,...extraHeaders}});
+    return {root,settings,service,request};
+  });
+  t.after(async()=>{
+    try {
+      for (const device of devices) await device.service.app.close();
+      for (const database of names) await admin.query(`DROP DATABASE IF EXISTS ${database}`);
+    } finally { await admin.end(); }
+  });
+  const [a,b] = devices;
+  for (const device of devices) {
+    await device.service.initialize();
+    const configured = await device.request('PUT','/settings',device.settings);
+    assert.equal(configured.statusCode,200,configured.body);
+  }
+  const publish = async (device:typeof a,title:string,tags:string[]) => {
+    const plan = (await device.request('POST','/scan',{paths:[source]})).json<Plan>();
+    const result = await device.request('POST','/publish',{id:plan.id,title,tags,preview:plan.preview,
+      paths:plan.files.filter(file=>file.keep).map(file=>file.path)});
+    assert.equal(result.statusCode,200,result.body);
+    return result.json<Template>();
+  };
+  const backup = async (device:typeof a) => {
+    const result = await device.request('POST','/backup');
+    assert.equal(result.statusCode,200,result.body);
+    return result.json().file as string;
+  };
+  const restore = async (device:typeof a,file:string) => {
+    const result = await device.request('POST','/backup/restore',{file});
+    assert.equal(result.statusCode,200,result.body);
+    return result.json().result;
+  };
+  const copyTemplate = async (from:typeof a,to:typeof a,id:string) =>
+    cp(path.join(from.root,'templates',id),path.join(to.root,'templates',id),{recursive:true});
+
+  const first = await publish(a,'设备 A\t归档\\样本\n第二行',['A 标签']);
+  const recycled = await publish(a,'设备 A 回收站',['回收站标签']);
+  assert.equal((await a.request('DELETE',`/templates/${recycled.id}`)).statusCode,200);
+  const second = await publish(b,'设备 B 归档',['B 标签']);
+  const fromA = await backup(a);
+  const invalidFile = path.join(base,'invalid.dump');
+  await cp(fromA,invalidFile);
+  await writeFile(invalidFile.slice(0,-5)+'.sha256','0'.repeat(64));
+  assert.match((await b.request('POST','/backup/restore',{file:invalidFile})).json().message,/备份校验失败/);
+  assert.deepEqual(await restore(b,fromA),{imported:0,skipped:0,unavailable:2});
+
+  await copyTemplate(a,b,first.id);
+  const firstPreview = path.join(b.root,'templates',first.id,first.version,'project',first.preview);
+  const original = await readFile(firstPreview);
+  await writeFile(firstPreview,Buffer.alloc(original.length));
+  assert.deepEqual(await restore(b,fromA),{imported:0,skipped:0,unavailable:2});
+  await writeFile(firstPreview,original);
+  assert.deepEqual(await restore(b,fromA),{imported:1,skipped:0,unavailable:1});
+  const detail = (await b.request('GET',`/templates/${first.id}`)).json<Template>();
+  assert.equal(detail.title,first.title);
+  assert.deepEqual(detail.tags,first.tags);
+  assert.equal(detail.version,first.version);
+  assert.equal((await b.request('GET',`/templates/${first.id}/preview`,undefined,{range:'bytes=0-6'})).body,'fixture');
+
+  assert.equal((await b.request('PUT',`/templates/${first.id}/tags`,{tags:['本机标签']})).statusCode,200);
+  await copyTemplate(a,b,recycled.id);
+  assert.deepEqual(await restore(b,fromA),{imported:1,skipped:1,unavailable:0});
+  assert.deepEqual((await b.request('GET',`/templates/${first.id}`)).json<Template>().tags,['本机标签']);
+  assert.deepEqual((await b.request('POST','/library',{search:'',tags:[],mode:'all',trashed:true})).json().items.map((item:Template)=>item.id),[recycled.id]);
+
+  await copyTemplate(b,a,second.id);
+  assert.deepEqual(await restore(a,await backup(b)),{imported:1,skipped:2,unavailable:0});
+  assert.deepEqual((await a.request('GET',`/templates/${second.id}`)).json<Template>().tags,second.tags);
+  assert.deepEqual((await a.request('GET',`/templates/${first.id}`)).json<Template>().tags,first.tags);
+  assert.notDeepEqual(await readFile(path.join(a.root,'.vfx-library')),await readFile(path.join(b.root,'.vfx-library')));
 });
 
 test('从非标准目录递归识别工程、预览、缓存和渲染序列',async () => {
@@ -356,6 +442,52 @@ test('PostgreSQL 导入、同名隔离、标签、范围预览、打包与数据
   assert.deepEqual(await readdir(path.join(root,'staging')),[`.import-${unregisteredVersion}.json`]);
   assert.equal(await readFile(path.join(unregistered,'partial.abc'),'utf8'),'unfinished file');
   assert.equal(await readFile(path.join(project,'geo/sim.bgeo.sc'),'utf8'),'fixture houdini/geo/sim.bgeo.sc');
+  await server.app.close();
+
+  let failSave = true;
+  server = createServer({token,logPath,loadSettings:async()=>stored,saveSettings:async value=>{
+    if (failSave) throw new Error('模拟设置写入失败');
+    stored = value;
+  },progress:()=>undefined});
+  await server.initialize();
+  const migrate = (root:string) => server!.app.inject({method:'POST',url:'/settings/migrate-storage',headers:auth,payload:{root}});
+  assert.match((await migrate(path.join(root,'nested'))).json().message,/互相包含/);
+  assert.match((await migrate(source)).json().message,/请选择空目录/);
+  const destination = path.join(base,'新素材库');
+  await mkdir(destination);
+  const original = path.join(project,'geo/sim.bgeo.sc');
+  const originalData = await readFile(original);
+  await writeFile(original,Buffer.alloc(originalData.length));
+  assert.match((await migrate(destination)).json().message,/素材校验失败/);
+  await writeFile(original,originalData);
+  assert.match((await migrate(destination)).json().message,/模拟设置写入失败/);
+  assert.deepEqual(await readdir(destination),[]);
+  assert.equal(stored?.root,root);
+  assert.equal(path.relative(project,(await server.app.inject({url:`/templates/${ids[0]}/directory`,headers:auth})).json().directory),'');
+
+  failSave = false;
+  const migrated = await migrate(destination);
+  assert.equal(migrated.statusCode,200,migrated.body);
+  assert.deepEqual(stored,{...settings,root:destination});
+  assert.deepEqual(await readFile(path.join(destination,'.vfx-library')),await readFile(path.join(root,'.vfx-library')));
+  assert.deepEqual(await readFile(original),originalData);
+  const movedProject = path.join(destination,path.relative(root,project));
+  assert.deepEqual(await readFile(path.join(movedProject,'geo/sim.bgeo.sc')),originalData);
+  assert.equal(path.relative(movedProject,(await server.app.inject({url:`/templates/${ids[0]}/directory`,headers:auth})).json().directory),'');
+  assert.equal((await server.app.inject({url:`/templates/${ids[0]}/preview`,headers:{...auth,range:'bytes=0-6'}})).body,'fixture');
+  await server.app.close();
+  server = createServer({token,logPath,loadSettings:async()=>stored,saveSettings:async()=>undefined,progress:()=>undefined});
+  await server.initialize();
+  assert.equal((await server.app.inject({url:'/settings',headers:auth})).json().settings.root,destination);
+  assert.equal(path.relative(movedProject,(await server.app.inject({url:`/templates/${ids[0]}/directory`,headers:auth})).json().directory),'');
+  const planAfterMigration = (await server.app.inject({method:'POST',url:'/scan',headers:auth,payload:{paths:[source]}})).json<Plan>();
+  const publishedAfterMigration = await server.app.inject({method:'POST',url:'/publish',headers:auth,
+    payload:{...publishInput,id:planAfterMigration.id,title:'迁移后入库'}});
+  assert.equal(publishedAfterMigration.statusCode,200,publishedAfterMigration.body);
+  const publishedId = publishedAfterMigration.json<Template>().id;
+  assert.ok((await readdir(path.join(destination,'templates'))).includes(publishedId));
+  assert.ok(!(await readdir(path.join(root,'templates'))).includes(publishedId));
+
   const log = await readFile(logPath,'utf8');
   assert.match(log,/database\.created/);
   assert.match(log,/"errorCode":"42501"/);

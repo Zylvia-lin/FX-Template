@@ -16,7 +16,7 @@ function tool(name: string) {
   return existsSync(bundled) ? bundled : name;
 }
 
-async function run(name: string, args: string[], password?: string) {
+export async function runPgTool(name: string, args: string[], password?: string) {
   await new Promise<void>((resolve,reject) => {
     const processHandle = spawn(tool(name),args,{
       env:{...process.env,...(password === undefined ? {} : {PGPASSWORD:password}),PGCONNECT_TIMEOUT:'10',PGCLIENTENCODING:'UTF8'},
@@ -56,6 +56,8 @@ export class Backups {
 
   stop() { clearInterval(this.timer); this.timer = undefined; }
 
+  async waitForCurrent() { await this.running?.catch(()=>undefined); }
+
   private async tick() {
     const timer = this.timer;
     const now = new Date();
@@ -93,8 +95,8 @@ export class Backups {
     log.info('backup.started');
     try {
       await mkdir(backupDirectory,{recursive:true});
-      await run('pg_dump',['--format=custom','--no-acl','--no-owner','--no-password','--host',host,'--port',String(port),'--username',user,'--dbname',database,'--file',temporary],password);
-      await run('pg_restore',['--list',temporary]);
+      await runPgTool('pg_dump',['--format=custom','--no-acl','--no-owner','--no-password','--host',host,'--port',String(port),'--username',user,'--dbname',database,'--file',temporary],password);
+      await runPgTool('pg_restore',['--list',temporary]);
       const hash = createHash('sha256');
       for await (const chunk of createReadStream(temporary)) hash.update(chunk);
       const sha256 = hash.digest('hex');

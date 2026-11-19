@@ -82,6 +82,12 @@ export interface BackupResult {
   sha256: string;
 }
 
+export interface RestoreResult {
+  imported: number;
+  skipped: number;
+  unavailable: number;
+}
+
 export interface ArchiveProgress {
   id: string;
   stage: 'copy' | 'register';
@@ -103,6 +109,7 @@ export interface DesktopApi {
   loadCatalogFilters(): Promise<CatalogFilters>;
   saveCatalogFilters(filters: CatalogFilters): Promise<void>;
   configure(settings: Settings): Promise<void>;
+  migrateStorage(root: string): Promise<void>;
   pickDirectory(): Promise<string | undefined>;
   pickDirectories(): Promise<string[]>;
   pickSource(): Promise<string[]>;
@@ -114,6 +121,7 @@ export interface DesktopApi {
   trash(id: string): Promise<void>;
   restore(id: string): Promise<void>;
   backup(): Promise<BackupResult>;
+  restoreDatabase(): Promise<RestoreResult | undefined>;
   export(id: string, mode: 'slim' | 'full'): Promise<string | undefined>;
   openTemplateDirectory(id: string): Promise<void>;
   openLogs(): Promise<void>;

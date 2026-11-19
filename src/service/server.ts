@@ -37,6 +37,8 @@ export function createServer(options: {
   let backups: Backups | undefined;
   let warning: string | undefined;
   let configuring = false;
+  let migrating = false;
+  let importing = 0;
   app.addHook('onRequest',async (request,reply) => {
     const authorization = request.headers.authorization;
     const route = request.routeOptions.url;
@@ -105,16 +107,45 @@ export function createServer(options: {
       throw error;
     } finally { configuring = false; }
   });
+  app.post<{Body:{root:string}}>('/settings/migrate-storage',{
+    schema:{body:allRequired({root:shortStringWithPath()})},
+  },async request => {
+    const current = active();
+    if (configuring) throw new Error('已有配置更新正在运行');
+    if (importing) throw new Error('请等待模板扫描或入库完成后再迁移素材库');
+    configuring = migrating = true;
+    backups?.stop();
+    try {
+      await backups?.waitForCurrent();
+      await current.migrateStorage(request.body.root,async root=>{
+        const next = {...settings!,root};
+        await options.saveSettings(next);
+        settings = next;
+      });
+      return {ok:true};
+    } finally {
+      configuring = migrating = false;
+      backups?.start();
+    }
+  });
   app.post<{Body:{paths:string[];previousPlanId?:string}}>('/scan',{schema:{body:{
     type:'object',required:['paths'],additionalProperties:false,
     properties:{paths:{type:'array',minItems:1,maxItems:100,items:shortStringWithPath()},previousPlanId:uuid},
-  }}},async request => active().scan(request.body.paths,request.body.previousPlanId));
+  }}},async request => {
+    if (migrating) throw new Error('素材库正在迁移，请稍后再扫描');
+    importing++;
+    try { return await active().scan(request.body.paths,request.body.previousPlanId); }
+    finally { importing--; }
+  });
   app.post<{Body:PublishInput}>('/publish',{schema:{body:allRequired({
     id:uuid,title:shortString,tags,preview:shortStringWithPath(),
     paths:{type:'array',minItems:1,maxItems:200000,items:shortStringWithPath()},
   })}},async request => {
+    if (migrating) throw new Error('素材库正在迁移，请稍后再入库');
     if (!request.body.title.trim()) throw new Error('请输入模板名称');
-    return active().publish(request.body,options.progress);
+    importing++;
+    try { return await active().publish(request.body,options.progress); }
+    finally { importing--; }
   });
   app.post<{Body:{search:string;tags:string[];mode:'all'|'any';trashed?:boolean;page?:number}}>('/library',{schema:{body:{
     type:'object',required:['search','tags','mode'],additionalProperties:false,
@@ -158,9 +189,19 @@ export function createServer(options: {
     return {ok:true};
   });
   app.post('/backup',async () => {
+    if (migrating) throw new Error('素材库正在迁移，请稍后再备份');
     active();
     if (!backups) throw new Error(backupDirectoryError);
     return backups.create();
+  });
+  app.post<{Body:{file:string}}>('/backup/restore',{
+    schema:{body:allRequired({file:shortStringWithPath()})},
+  },async request=>{
+    const current = active();
+    if (configuring) throw new Error('请等待配置更新或恢复完成');
+    configuring = true;
+    try { return {ok:true,result:await current.restoreDatabase(request.body.file)}; }
+    finally { configuring = false; }
   });
   app.get<{Params:{id:string}}>('/templates/:id/preview',{schema:{params:idParams}},async (request,reply) => {
     const {file,bytes} = await active().preview(request.params.id);
