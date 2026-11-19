@@ -1,0 +1,44 @@
+{
+  "name": "vfx-template-library",
+  "productName": "特效模板库",
+  "version": "1.1.0",
+  "description": "Windows 本地特效工程与素材模板管理工具",
+  "author": {"name": "Zylvia"},
+  "private": true,
+  "type": "module",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "start": "electron .",
+    "dev": "npm run build && electron .",
+    "release:win": "node scripts/release-win.mjs",
+    "test": "tsx --test tests/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "fastify": "^5.6.0",
+    "pg": "^8.16.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "yazl": "^3.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/pg": "^8.15.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@types/yazl": "^3.3.0",
+    "electron": "^45.3.4",
+    "electron-builder": "^26.18.0",
+    "esbuild": "^0.28.2",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0",
+    "vite": "^8.3.8"
+  },
+  "build": {
+    "appId": "com.zylvia.vfx-template-library",
+    "copyright": "Copyright © 2026 Zylvia. All rights reserved.",
+    "directories": {"output": "release"},
+    "files": ["dist/**", "!**/*.map"]
+  }
+}
