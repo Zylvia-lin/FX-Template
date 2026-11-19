@@ -124,6 +124,8 @@ function textureSequenceGroups<T extends {path:string;kind:FileKind}>(files:T[])
   return sequenceGroups(files,'texture').filter(({summary,files:members,frames})=>{
     const directory = path.posix.dirname(summary.path);
     if (members.length!==textures.get(directory) || summary.count<5 || /(?:^|[._-])udim(?:[._-]|$)/iu.test(path.posix.basename(summary.path))) return false;
+    // Four-digit texture numbers in the UDIM range are ambiguous without DCC metadata.
+    if (summary.path.includes('%04d') && summary.first>=1001 && summary.last<=1999) return false;
     const numbers = [...frames].sort((a,b)=>a-b);
     let consecutive = 1;
     return numbers.some((frame,index)=>{

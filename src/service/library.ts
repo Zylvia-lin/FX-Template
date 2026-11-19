@@ -105,29 +105,65 @@ export async function openLibrary(settings: Settings, log: FastifyBaseLogger, in
     await pool.end();
     throw setupError(error,settings.database);
   }
+  let locked = false;
+  const bindingLock = "hashtextextended('vfx_library.initialize',0)";
   try {
+    await client.query('SELECT pg_advisory_lock('+bindingLock+')');
+    locked = true;
     await mkdir(root, {recursive: true});
     root = await realpath(root);
     const marker = path.join(root, '.vfx-library');
+    const pendingMarker = path.join(root, '.vfx-library-pending');
+    const stagedMarker = path.join(root, '.vfx-library-marker');
     const directoryId = await readFile(marker, 'utf8').then(value => value.trim()).catch(error => {
       if (error.code === 'ENOENT') return undefined;
       throw error;
     });
-    if (!directoryId && (await readdir(root)).some(name => name !== 'desktop.ini')) {
-      throw new Error('请选择空目录，或选择已经与此数据库绑定的模板库');
+    const connection = {host:settings.host.toLowerCase(),port:settings.port,database:settings.database};
+    let pendingId: string | undefined;
+    if (!directoryId) {
+      const pending = await readFile(pendingMarker,'utf8').then(value=>JSON.parse(value) as {
+        id:string;host:string;port:number;database:string;
+      }).catch(error=>{
+        if (error.code==='ENOENT') return undefined;
+        throw error;
+      });
+      if (pending) {
+        if (!importVersion.test('.import-'+pending.id+'.json') ||
+          pending.host!==connection.host || pending.port!==connection.port || pending.database!==connection.database) {
+          throw new Error('素材库初始化尚未完成，请使用原数据库连接重试');
+        }
+        pendingId = pending.id;
+      }
+      const allowed = pendingId ? ['desktop.ini','.vfx-library-pending','.vfx-library-marker','staging','templates'] : ['desktop.ini'];
+      if ((await readdir(root)).some(name=>!allowed.includes(name))) {
+        throw new Error('请选择空目录，或选择已经与此数据库绑定的模板库');
+      }
+      if (pendingId) {
+        const created = await Promise.all(['staging','templates'].map(name=>readdir(path.join(root,name)).catch(error=>{
+          if (error.code==='ENOENT') return [];
+          throw error;
+        })));
+        if (created.some(entries=>entries.length)) throw new Error('未完成初始化的素材库目录含有文件，请检查目录');
+      }
     }
     await client.query('BEGIN');
     await client.query(schema);
     let id: string = (await client.query('SELECT id FROM vfx_library')).rows[0]?.id;
     if (directoryId && !id) throw new Error('所选数据库没有此素材库的绑定记录，请连接原数据库');
-    if (id && id !== directoryId) throw new Error('数据库与素材库目录不匹配，请使用对应的原目录');
+    if (id && id !== (directoryId ?? pendingId)) throw new Error('数据库与素材库目录不匹配，请使用对应的原目录');
     if (!id) {
-      id = randomUUID();
+      id = pendingId ?? randomUUID();
+      if (!pendingId) await writeFile(pendingMarker,JSON.stringify({...connection,id}),{flag:'wx',flush:true});
       await client.query('INSERT INTO vfx_library(id) VALUES($1)', [id]);
     }
-    if (!directoryId) await writeFile(marker, id + '\n', {flag: 'wx'});
     await Promise.all(['staging', 'templates'].map(name => mkdir(path.join(root, name), {recursive: true})));
     await client.query('COMMIT');
+    if (!directoryId) {
+      await writeFile(stagedMarker,id+'\n',{flush:true});
+      await rename(stagedMarker,marker);
+      await rm(pendingMarker,{force:true}).catch(error=>log.warn(errorFields(error),'library.pending_cleanup_failed'));
+    }
     log.info({module: 'database', database: settings.database, libraryId: id}, 'library.opened');
     const library = new Library(pool,root,id,log);
     await library.recoverImports();
@@ -137,7 +173,8 @@ export async function openLibrary(settings: Settings, log: FastifyBaseLogger, in
     void pool.end();
     throw setupError(error,settings.database);
   } finally {
-    client.release();
+    const unlocked = !locked || await client.query('SELECT pg_advisory_unlock('+bindingLock+')').then(()=>true,()=>false);
+    client.release(!unlocked);
   }
 }
 
@@ -367,6 +404,16 @@ export class Library {
     return plan;
   }
 
+  async scanPreview(id: string, relative: string) {
+    const movie = this.plans.get(id)?.files.find(file => file.path === relative && file.kind === 'movie');
+    if (!movie) throw new Error('未找到导入预览');
+    const file = await realpath(movie.sourcePath);
+    const info = await lstat(movie.sourcePath);
+    if (path.relative(movie.sourcePath,file) || !info.isFile() ||
+      info.size !== movie.bytes || info.mtimeMs !== movie.modified) throw new Error('源文件已修改，请重新扫描');
+    return {file,bytes:info.size};
+  }
+
   async publish(input: PublishInput, progress: (event: ArchiveProgress) => void): Promise<Template> {
     const plan = this.plans.get(input.id);
     if (!plan) throw new Error('导入清单已经失效，请重新扫描');
@@ -582,7 +629,7 @@ export class Library {
 
   async list(search: string, wanted: string[], mode: 'all' | 'any', trashed = false, page = 0) {
     const pageSize = 500;
-    const items = await this.findTemplates(search,wanted,mode,trashed,trashed?pageSize+1:pageSize,trashed?page*pageSize:0);
+    const items = await this.findTemplates(search,wanted,mode,trashed,pageSize+1,page*pageSize);
     const available = await this.pool.query(`
       SELECT g.name FROM vfx_tags g
       WHERE EXISTS (

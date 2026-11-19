@@ -34,7 +34,7 @@ export async function runPgTool(name: string, args: string[], password?: string)
 
 export class Backups {
   private running?: Promise<BackupResult>;
-  private lastAttempt?: string;
+  private lastCompletedDay?: string;
   private timer?: NodeJS.Timeout;
 
   constructor(private settings:Settings,private libraryId:string,private log:FastifyBaseLogger) {}
@@ -42,7 +42,7 @@ export class Backups {
   configure(settings:Settings) {
     this.stop();
     this.settings = settings;
-    this.lastAttempt = undefined;
+    this.lastCompletedDay = undefined;
     this.start();
   }
 
@@ -66,14 +66,15 @@ export class Backups {
     due.setHours(hour,minute,0,0);
     if (due > now) due.setDate(due.getDate()-1);
     const day = stamp(due);
-    if (this.lastAttempt === day || this.running) return;
+    if (this.lastCompletedDay === day || this.running) return;
     await mkdir(this.settings.backupDirectory,{recursive:true});
     if (this.timer !== timer) return;
     const entries = await readdir(this.settings.backupDirectory);
-    if (this.timer !== timer || this.lastAttempt === day || this.running) return;
-    this.lastAttempt = day;
-    if (entries.some(file => file.startsWith(`vfx-${this.libraryId}-scheduled-${day}-`) && file.endsWith('.dump'))) return;
-    await this.create(day);
+    if (this.timer !== timer || this.lastCompletedDay === day || this.running) return;
+    if (!entries.some(file => file.startsWith(`vfx-${this.libraryId}-scheduled-${day}-`) && file.endsWith('.dump'))) {
+      await this.create(day);
+    }
+    if (this.timer === timer) this.lastCompletedDay = day;
   }
 
   create(scheduledDay?:string) {

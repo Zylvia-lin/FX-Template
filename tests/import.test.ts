@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { cp, mkdir, mkdtemp, readFile, readdir, realpath, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { test } from 'node:test';
@@ -18,7 +18,7 @@ async function fixture() {
   }
   for (const name of [
     'shot_efx_v01.hip','shot_efx_v01.nk','shot_efx_v01.nk~','shot_efx_ck_v001.mov','shot_ANI_ck.mov',
-    'abc/fx.abc','abc/model.fbx','backup/old.hip','render/fx.1001.exr','render/fx.1003.exr',
+    'abc/fx.abc','abc/model.fbx','backup/old.hip','render/fx.1001.exr','render/fx.1003.exr','render/still.exr',
     'tex/map.1001.exr','tex/map.1002.exr','hda/template.hda',
     'tex/mixed/albedo.dds','tex/few/label.0001.png','tex/few/label.0002.png','tex/few/label.0003.png',
     ...Array.from({length:5},(_,index)=>{
@@ -79,6 +79,63 @@ test('按项目组织混合素材，选择预览并区分 UDIM 与帧序列',asy
   for (const invalid of ['../bad','.git/../bad','a\\..\\b','foo/C:stream','aux.txt','name.']) {
     assert.throws(()=>nativePath(root,invalid),/路径/);
   }
+});
+
+test('连续四位 UDIM 贴图不会进入序列或压缩候选', async t=>{
+  const base = await mkdtemp(path.join(tmpdir(),'vfx-udim-'));
+  t.after(()=>rm(base,{recursive:true,force:true}));
+  const source = path.join(base,'source');
+  const directory = path.join(source,'tex','creature');
+  await mkdir(directory,{recursive:true});
+  await Promise.all(Array.from({length:5},(_,i)=>writeFile(path.join(directory,'albedo.'+(1001+i)+'.exr'),'fixture')));
+  const plan = await scanSources([source],path.join(base,'library'));
+  assert.equal(plan.files.length,5);
+  assert.ok(plan.files.every(file=>file.keep && file.kind==='texture' && !file.archiveZip));
+  assert.deepEqual(plan.sequences,[]);
+});
+
+test('初始化提交失败后可使用原目录和数据库重试', {skip:!process.env.VFX_TEST_PG_PORT}, async t=>{
+  const base = await mkdtemp(path.join(tmpdir(),'vfx-init-retry-'));
+  const root = path.join(base,'library');
+  const database = 'vfx_init_retry_'+randomUUID().replaceAll('-','');
+  const settings = {root,database,host:'127.0.0.1',port:Number(process.env.VFX_TEST_PG_PORT),
+    user:'vfx_test',password:'',backupDirectory:'',backupTime:'',backupRetention:2};
+  const admin = new pg.Client({...settings,database:'postgres'});
+  await admin.connect();
+  const token = 'init-retry-test';
+  const service = createServer({token,logPath:path.join(base,'init.log'),loadSettings:async()=>undefined,
+    saveSettings:async()=>undefined,progress:()=>undefined});
+  t.after(async()=>{
+    await service.app.close();
+    try { await admin.query('DROP DATABASE IF EXISTS "'+database+'"'); }
+    finally { await admin.end(); }
+  });
+  await admin.query('CREATE DATABASE "'+database+'"');
+  const db = new pg.Client(settings);
+  await db.connect();
+  try {
+    await db.query(`
+      CREATE TABLE vfx_library (singleton boolean PRIMARY KEY DEFAULT TRUE CHECK (singleton), id uuid NOT NULL);
+      CREATE FUNCTION fail_initial_binding() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION 'simulated commit failure'; END;
+      $$;
+      CREATE CONSTRAINT TRIGGER fail_initial_binding AFTER INSERT ON vfx_library
+        DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fail_initial_binding();
+    `);
+    const configure = ()=>service.app.inject({method:'PUT',url:'/settings',payload:settings,
+      headers:{authorization:'Bearer '+token}});
+    const failed = await configure();
+    assert.equal(failed.statusCode,400,failed.body);
+    assert.match(failed.body,/P0001/);
+    assert.equal((await db.query('SELECT id FROM vfx_library')).rowCount,0);
+    await assert.rejects(readFile(path.join(root,'.vfx-library')),{code:'ENOENT'});
+    await db.query('DROP TRIGGER fail_initial_binding ON vfx_library');
+    const retried = await configure();
+    assert.equal(retried.statusCode,200,retried.body);
+    const {rows:[{id}]} = await db.query('SELECT id FROM vfx_library');
+    assert.equal((await readFile(path.join(root,'.vfx-library'),'utf8')).trim(),id);
+    await assert.rejects(readFile(path.join(root,'.vfx-library-pending')),{code:'ENOENT'});
+  } finally { await db.end(); }
 });
 
 test('两套独立数据库通过备份双向合并新 ID，缺少素材可重试', {skip:!process.env.VFX_TEST_PG_PORT}, async t=>{
@@ -414,6 +471,18 @@ test('PostgreSQL 导入、同名隔离、标签、范围预览、打包与数据
   assert.ok(!full.rawPayload.includes(Buffer.from('project/render/fx.1001.exr')));
   assert.ok(full.rawPayload.includes(Buffer.from('project/abc.zip')));
   assert.ok(full.rawPayload.includes(Buffer.from('project/'+textureZip)));
+  const corruptedFile = path.join(project,'shot_efx_v01.hip');
+  const originalExportFile = await readFile(corruptedFile);
+  const address = await server.app.listen({host:'127.0.0.1',port:0});
+  try {
+    await writeFile(corruptedFile,Buffer.alloc(originalExportFile.length,0x61));
+    await assert.rejects(async ()=>{
+      const response = await fetch(address+'/templates/'+ids[0]+'/package?mode=full',{
+        headers:{authorization:'Bearer '+token},signal:AbortSignal.timeout(3000),
+      });
+      await response.arrayBuffer();
+    },TypeError);
+  } finally { await writeFile(corruptedFile,originalExportFile); }
   const legacy = (await request('GET',`/templates/${ids[1]}`)).json<TemplateDetail>();
   const legacyProject = path.join(root,'templates',legacy.id,legacy.version,'project');
   const toolsRoute = '/tools/compress-storage';
@@ -476,6 +545,18 @@ test('PostgreSQL 导入、同名隔离、标签、范围预览、打包与数据
     await dataClient.query(`INSERT INTO vfx_templates(id,version,title,preview,manifest,sequences,bytes,files,deleted_at)
       SELECT gen_random_uuid(),gen_random_uuid(),'回收站测试 '||n,'preview.mov','[]','[]',1,1,now()
       FROM generate_series(1,501) AS n`);
+    await dataClient.query(`INSERT INTO vfx_templates(id,version,title,preview,manifest,sequences,bytes,files)
+      SELECT gen_random_uuid(),gen_random_uuid(),'分页验证 '||n,'preview.mov','[]','[]',1,1
+      FROM generate_series(1,501) AS n`);
+    const query = {search:'分页验证',tags:[],mode:'any'};
+    const publishedPage0 = (await request('POST','/library',query)).json<{items:Template[];hasNext:boolean}>();
+    const publishedPage1 = (await request('POST','/library',{...query,page:1})).json<typeof publishedPage0>();
+    assert.equal(publishedPage0.items.length,500);
+    assert.equal(publishedPage0.hasNext,true);
+    assert.equal(publishedPage1.items.length,1);
+    assert.equal(publishedPage1.hasNext,false);
+    assert.ok(!publishedPage0.items.some(item=>item.id===publishedPage1.items[0].id));
+    await dataClient.query("DELETE FROM vfx_templates WHERE title LIKE '分页验证 %'");
   } finally { await dataClient.end(); }
   const trashQuery = {search:'',tags:[],mode:'any',trashed:true};
   const page0 = (await request('POST','/library',trashQuery)).json<{items:Template[];hasNext:boolean}>();
@@ -579,13 +660,24 @@ test('PostgreSQL 导入、同名隔离、标签、范围预览、打包与数据
   assert.equal(path.relative(movedProject,(await server.app.inject({url:`/templates/${ids[0]}/directory`,headers:auth})).json().directory),'');
   const planAfterMigration = (await server.app.inject({method:'POST',url:'/scan',headers:auth,payload:{paths:[source]}})).json<Plan>();
   const publishedAfterMigration = await server.app.inject({method:'POST',url:'/publish',headers:auth,
-    payload:{...publishInput,id:planAfterMigration.id,title:'迁移后入库'}});
+    payload:{...publishInput,id:planAfterMigration.id,title:'迁移后入库',archives:['tex/Dan/DPCD.zip'],
+      paths:planAfterMigration.files.filter(file=>file.keep && file.archiveZip!=='abc.zip' &&
+        !(file.kind==='image'&&file.archivePath.startsWith('render/'))).map(file=>file.path)}});
   assert.equal(publishedAfterMigration.statusCode,200,publishedAfterMigration.body);
-  const publishedId = publishedAfterMigration.json<Template>().id;
+  const {id:publishedId,version:publishedVersionAfterMigration} = publishedAfterMigration.json<Template>();
   assert.ok((await readdir(path.join(destination,'templates'))).includes(publishedId));
   assert.ok(!(await readdir(path.join(root,'templates'))).includes(publishedId));
+  const excludedProject = path.join(destination,'templates',publishedId,publishedVersionAfterMigration,'project');
+  const packedDetail = (await server.app.inject({url:`/templates/${publishedId}`,headers:auth})).json<TemplateDetail>();
+  assert.ok(packedDetail.manifest.some(file=>file.path==='tex/Dan/DPCD.zip'));
+  assert.ok(packedDetail.manifest.some(file=>file.path==='abc/model.fbx'));
+  for (const name of ['render.zip','abc.zip','render/still.exr','render/fx.1001.exr','abc/fx.abc']) {
+    assert.ok(!packedDetail.manifest.some(file=>file.path===name));
+    await assert.rejects(readFile(path.join(excludedProject,name)),{code:'ENOENT'});
+  }
 
   const log = await readFile(logPath,'utf8');
+  assert.match(log,/export\.archive_failed/);
   assert.match(log,/database\.created/);
   assert.match(log,/"errorCode":"42501"/);
   assert.match(log,/import\.published/);

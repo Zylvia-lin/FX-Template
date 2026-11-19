@@ -73,10 +73,15 @@ async function start() {
   protocol.handle('vfx-media', async request => {
     const url = new URL(request.url);
     const id = url.pathname.slice(1);
-    if (url.hostname !== 'preview' || !/^[0-9a-f-]{36}$/.test(id)) return new Response(null,{status:404});
+    if (!/^[0-9a-f-]{36}$/.test(id)) return new Response(null,{status:404});
+    const source = url.searchParams.get('path');
+    const route = url.hostname === 'preview' ? '/templates/'+id+'/preview'
+      : url.hostname === 'scan-preview' && source ? '/scan/'+id+'/preview?'+new URLSearchParams({path:source})
+      : undefined;
+    if (!route) return new Response(null,{status:404});
     const range = request.headers.get('range');
     try {
-      const response = await fetch(`${origin}/templates/${id}/preview`,{
+      const response = await fetch(origin+route,{
         signal:AbortSignal.any([request.signal,abort.signal]),
         headers:{authorization:`Bearer ${token}`,...(range ? {range} : {})},
       });

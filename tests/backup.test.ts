@@ -30,3 +30,21 @@ test('手动备份结束后，下一次调度仍会执行到期的定时备份',
   assert.equal(triggers.length,2);
   assert.match(triggers[1] ?? '',/^\d{4}-\d{2}-\d{2}$/);
 });
+
+test('定时备份失败后会在当天重试，成功后停止重试', async t => {
+  const directory = await mkdtemp(path.join(tmpdir(),'vfx-backup-retry-'));
+  t.after(()=>rm(directory,{recursive:true,force:true}));
+  const backups = new Backups({
+    root:directory,host:'localhost',port:5432,database:'test',user:'test',password:'',
+    backupDirectory:directory,backupTime:'00:00',backupRetention:2,
+  },'test',{} as FastifyBaseLogger);
+  let attempts = 0;
+  Object.assign(backups,{async write() {
+    if (++attempts===1) throw new Error('模拟临时故障');
+    return {file:'fixture.dump',bytes:1,sha256:'fixture'};
+  }});
+  await assert.rejects(backups['tick'](),/模拟临时故障/);
+  await Promise.all([backups['tick'](),backups['tick']()]);
+  await backups['tick']();
+  assert.equal(attempts,2);
+});

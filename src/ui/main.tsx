@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { archiveNames, archiveSizes } from '../contracts';
-import type { ArchiveName, ArchiveProgress, CatalogFilters, DesktopApi, DesktopProgress, PackCandidate, PackExistingResult, PackProgress, Plan, Settings, Template, TemplateDetail } from '../contracts';
+import type { ArchiveName, ArchiveProgress, CatalogFilters, DesktopApi, DesktopProgress, PackCandidate, PackExistingResult, PackProgress, Plan, Settings, SourceFile, Template, TemplateDetail } from '../contracts';
 import './style.css';
 
 declare global { interface Window {vfx: DesktopApi;} }
@@ -65,9 +65,9 @@ function App() {
   const [status,setStatus] = useState<Awaited<ReturnType<DesktopApi['status']>>>();
   const [panel,setPanel] = useState<'library'|'settings'|'trash'|'toolbox'>('library');
   const [items,setItems] = useState<Template[]>([]);
-  const [trashPage,setTrashPage] = useState(0);
-  const [trashHasNext,setTrashHasNext] = useState(false);
-  const [trashLoading,setTrashLoading] = useState(false);
+  const [page,setPage] = useState(0);
+  const [hasNext,setHasNext] = useState(false);
+  const [pageLoading,setPageLoading] = useState(false);
   const [cardZoom,setCardZoom] = useState(0);
   const [available,setAvailable] = useState<string[]>([]);
   const [activeTags,setActiveTags] = useState<string[]>([]);
@@ -116,27 +116,27 @@ function App() {
   useEffect(()=>{
     if (!status?.configured) return;
     let obsolete = false;
+    setPageLoading(true);
     const timeout = setTimeout(()=>void api.list({search:trashOpen?'':search,tags:trashOpen?[]:activeTags,mode,
-      trashed:trashOpen,page:trashOpen?trashPage:undefined}).then(result=>{
+      trashed:trashOpen,page}).then(result=>{
       if (obsolete) return;
-      if (trashOpen) {
-        if (!result.items.length && trashPage>0) {setTrashPage(trashPage-1);return;}
-        setTrashHasNext(result.hasNext);
-        setTrashLoading(false);
-      }
+      if (!result.items.length && page>0) {setPage(page-1);return;}
+      setHasNext(result.hasNext);
+      setPageLoading(false);
       setItems(result.items);setAvailable(result.tags);
       const availableTags = new Set(result.tags);
-      setActiveTags(previous=>{
-        const remaining = previous.filter(tag=>availableTags.has(tag));
-        return remaining.length===previous.length ? previous : remaining;
-      });
+      const remaining = activeTags.filter(tag=>availableTags.has(tag));
+      if (remaining.length!==activeTags.length) {
+        setActiveTags(remaining);
+        if (!trashOpen) setPage(0);
+      }
     }).catch(err=>{
       if (obsolete) return;
-      if (trashOpen) setTrashLoading(false);
+      setPageLoading(false);
       setError(errorText(err));
     }),150);
     return ()=>{obsolete=true;clearTimeout(timeout);};
-  },[search,activeTags,mode,trashOpen,trashPage,status?.configured,revision]);
+  },[search,activeTags,mode,trashOpen,page,status?.configured,revision]);
 
   async function action<T>(label:string, callback:()=>Promise<T>) {
     setBusy(label);setError('');setNotice('');
@@ -191,13 +191,18 @@ function App() {
   });
   const restore = (id:string) => action('正在恢复模板',async()=>{
     await api.restore(id);
-    setTrashLoading(true);
+    setPageLoading(true);
     setItems(list=>list.filter(item=>item.id!==id));
     setRevision(value=>value+1);setNotice('模板已恢复');
   });
-  const openTrashPage = (page:number) => {
-    setItems([]);setTrashHasNext(false);setTrashLoading(true);setTrashPage(page);
+  const openPage = (next:number) => {
+    setItems([]);setHasNext(false);setPageLoading(true);setPage(next);setSelected(undefined);
   };
+  const pagination = (page>0||hasNext)&&<div className="toolbar pagination">
+    <button disabled={Boolean(busy)||pageLoading||page===0} onClick={()=>openPage(page-1)}>上一页</button>
+    <span>第 {page+1} 页</span>
+    <button disabled={Boolean(busy)||pageLoading||!hasNext} onClick={()=>openPage(page+1)}>下一页</button>
+  </div>;
   const settingsOpen = Boolean(status && (!status.configured || panel==='settings'));
   const toolboxOpen = panel==='toolbox' && Boolean(status?.configured);
   const libraryOpen = !settingsOpen&&!trashOpen&&!toolboxOpen;
@@ -215,17 +220,18 @@ function App() {
     <aside className="rail">
       <div className="brand"><span className="brand-mark">✦</span><strong>特效模板库</strong></div>
       <div className="rail-label">工作区</div>
-      <button className={libraryOpen?'nav current':'nav'} onClick={()=>{if(trashOpen)setItems([]);setPanel('library');setPlan(undefined);}} disabled={Boolean(busy)||!status?.configured}>▦ <span>全部模板</span></button>
+      <button className={libraryOpen?'nav current':'nav'} onClick={()=>{if(trashOpen)openPage(0);setPanel('library');setPlan(undefined);}} disabled={Boolean(busy)||!status?.configured}>▦ <span>全部模板</span></button>
       <button className={trashOpen?'nav current':'nav'} onClick={()=>{
-        if(!trashOpen)openTrashPage(0);
+        if(!trashOpen)openPage(0);
         setPanel('trash');setPlan(undefined);setSelected(undefined);
       }} disabled={Boolean(busy)||!status?.configured}>⌫ <span>回收站</span></button>
-      <button className={settingsOpen?'nav current':'nav'} onClick={()=>{setPanel('settings');setPlan(undefined);}} disabled={Boolean(busy)||!status}>⚙ <span>库设置</span></button>
-      <button className={toolboxOpen?'nav current':'nav'} onClick={()=>{setPanel('toolbox');setPlan(undefined);}}
+      <button className={settingsOpen?'nav current':'nav'} onClick={()=>{if(trashOpen)openPage(0);setPanel('settings');setPlan(undefined);}} disabled={Boolean(busy)||!status}>⚙ <span>库设置</span></button>
+      <button className={toolboxOpen?'nav current':'nav'} onClick={()=>{if(trashOpen)openPage(0);setPanel('toolbox');setPlan(undefined);}}
         disabled={Boolean(busy)||!status?.configured}>▣ <span>工具箱</span></button>
       <div className="rail-label tag-heading">标签</div>
       {available.map(tag=><button className={`nav tag ${activeTags.includes(tag)?'chosen':''}`} key={tag} onClick={()=>{
-        if(trashOpen)setItems([]);
+        if(trashOpen)openPage(0);
+        else setPage(0);
         setPanel('library');setPlan(undefined);
         setActiveTags(list=>list.includes(tag)?list.filter(item=>item!==tag):[...list,tag]);
       }} disabled={Boolean(busy)}># <span>{tag}</span></button>)}
@@ -236,7 +242,7 @@ function App() {
     <main className="main">
       <header><div className="title">{settingsOpen?'库设置':toolboxOpen?'工具箱':plan?'导入预检':trashOpen?'回收站':'全部模板'}</div>
         {libraryOpen&&!plan&&status?.configured&&<div className="toolbar">
-          <input className="search" type="search" aria-label="搜索模板名称或标签" placeholder="搜索模板名称或标签" maxLength={100} value={search} onChange={event=>setSearch(event.target.value)}/>
+          <input className="search" type="search" aria-label="搜索模板名称或标签" placeholder="搜索模板名称或标签" maxLength={100} value={search} onChange={event=>{setSearch(event.target.value);setPage(0);}}/>
           <button disabled={Boolean(busy)} onClick={()=>void importPaths(()=>api.pickSource())}>选择文件</button>
           <button className="primary" disabled={Boolean(busy)} onClick={()=>void folders()}>＋ 导入目录</button>
         </div>}
@@ -261,17 +267,13 @@ function App() {
         addFiles={()=>void importPaths(()=>api.pickSource(),true)}
         publish={(title,tags,preview,paths,archives)=>void action('正在归档模板',async()=>{
         const template=await api.publish({id:plan.id,title,tags,preview,paths,archives});
-        setPlan(undefined);setSearch('');setRevision(value=>value+1);
+        setPlan(undefined);setSearch('');setPage(0);setRevision(value=>value+1);
         setSelected(await api.detail(template.id));
         setNotice('模板已入库');
       })}/>}
       {trashOpen&&status?.configured&&<section className="content trash-list">
-        {(trashPage>0||trashHasNext)&&<div className="toolbar pagination">
-          <button disabled={Boolean(busy)||trashLoading||trashPage===0} onClick={()=>openTrashPage(trashPage-1)}>上一页</button>
-          <span>第 {trashPage+1} 页</span>
-          <button disabled={Boolean(busy)||trashLoading||!trashHasNext} onClick={()=>openTrashPage(trashPage+1)}>下一页</button>
-        </div>}
-        {trashLoading?<p role="status">正在加载回收站…</p>:items.length===0?<div className="empty"><h2>回收站为空</h2></div>:items.map(item=><div key={item.id} className="trash-row">
+        {pagination}
+        {pageLoading?<p role="status">正在加载回收站…</p>:items.length===0?<div className="empty"><h2>回收站为空</h2></div>:items.map(item=><div key={item.id} className="trash-row">
           <div><strong>{item.title}</strong><p className="muted">{item.files} 个文件 · {bytes(item.bytes)}</p></div>
           <button disabled={Boolean(busy)} onClick={()=>void restore(item.id)}>恢复</button>
         </div>)}
@@ -281,10 +283,11 @@ function App() {
           <div className="library-head"><span>{items.length} 个模板</span>
             {activeTags.length>0&&<div className="filter">
               <label className="sr" htmlFor="mode">标签匹配模式</label>
-              <select id="mode" value={mode} onChange={e=>setMode(e.target.value==='all'?'all':'any')}><option value="any">匹配任一标签</option><option value="all">匹配全部标签</option></select>
-              <button onClick={()=>setActiveTags([])}>清除筛选</button></div>}
+              <select id="mode" value={mode} onChange={e=>{setMode(e.target.value==='all'?'all':'any');setPage(0);}}><option value="any">匹配任一标签</option><option value="all">匹配全部标签</option></select>
+              <button onClick={()=>{setActiveTags([]);setPage(0);}}>清除筛选</button></div>}
           </div>
-          {items.length===0?<div className="empty"><div className="empty-mark">▦</div><h2>{search||activeTags.length?'没有匹配的模板':'导入你的第一套特效模板'}</h2>
+          {pagination}
+          {pageLoading?<p role="status">正在加载模板…</p>:items.length===0?<div className="empty"><div className="empty-mark">▦</div><h2>{search||activeTags.length?'没有匹配的模板':'导入你的第一套特效模板'}</h2>
             <p>{search||activeTags.length?'试试更改搜索词或标签。':'把项目目录、HIP、NK 或 MOV 拖到这里。'}</p>
             {!search&&!activeTags.length&&<button className="primary" disabled={Boolean(busy)} onClick={()=>void folders()}>选择项目目录</button>}
           </div>:<TemplateGrid items={items} selected={selected?.id} disabled={Boolean(busy)}
@@ -381,14 +384,14 @@ function TemplateGrid({items,selected,disabled,zoom,onZoom,open}:{
     {items.map(item=><button className={`card ${selected===item.id?'selected':''}`} data-template-id={item.id}
       key={item.id} onClick={()=>open(item.id)} disabled={disabled}>
       <div className="tile">
-        {foreground&&visibility?.items===items&&visibility.ids.has(item.id)&&<TemplateVideo id={item.id}/>}
+        {foreground&&visibility?.items===items&&visibility.ids.has(item.id)&&<TemplateVideo src={`vfx-media://preview/${item.id}`}/>}
       </div>
       <div className="card-info"><strong>{item.title}</strong><span>{item.tags.slice(0,4).join(' · ')||`${item.files} 个文件`}</span></div>
     </button>)}
   </div>;
 }
 
-function TemplateVideo({id,controls=false,onError}:{id:string;controls?:boolean;onError?:()=>void}) {
+function TemplateVideo({src,controls=false,loop=!controls,onError}:{src:string;controls?:boolean;loop?:boolean;onError?:()=>void}) {
   const player = useRef<HTMLVideoElement>(null);
   useEffect(()=>{
     const video = player.current;
@@ -400,8 +403,8 @@ function TemplateVideo({id,controls=false,onError}:{id:string;controls?:boolean;
     };
   },[]);
   return <video ref={player} className={controls?'preview':undefined} aria-hidden={controls?undefined:true}
-    aria-label={controls?'模板视频预览':undefined} controls={controls} autoPlay muted loop={!controls} playsInline
-    src={`vfx-media://preview/${id}`} onError={onError}/>;
+    aria-label={controls?'模板视频预览':undefined} controls={controls} autoPlay muted loop={loop} playsInline
+    src={src} onError={onError}/>;
 }
 
 function ArchiveStatus({progress}: {progress:ArchiveProgress}) {
@@ -576,6 +579,18 @@ function Toolbox({working,pack}:{
   </section>;
 }
 
+const importFileGroups = [
+  {id:'render',label:'Render 序列'},
+  {id:'abc',label:'ABC 缓存'},
+] as const;
+
+type ImportFileGroup = typeof importFileGroups[number]['id'];
+
+function importFileGroup(file:SourceFile):ImportFileGroup|undefined {
+  if (file.archiveZip==='abc.zip') return 'abc';
+  if (file.kind==='image' && file.archivePath.startsWith('render/')) return 'render';
+}
+
 function ImportView({plan,working,close,addFolders,addFiles,publish}:{
   plan:Plan;working:boolean;close:()=>void;addFolders:()=>void;addFiles:()=>void;
   publish:(title:string,tags:string[],preview:string,paths:string[],archives:ArchiveName[])=>void;
@@ -585,7 +600,8 @@ function ImportView({plan,working,close,addFolders,addFiles,publish}:{
   const [tags,setTags] = useState<string[]>([]);
   const [tagDraft,setTagDraft] = useState('');
   const [preview,setPreview] = useState(plan.preview??'');
-  const [selected,setSelected] = useState(new Set(plan.files.filter(file=>file.keep).map(file=>file.path)));
+  const [previewError,setPreviewError] = useState('');
+  const [selected,setSelected] = useState(()=>new Set(plan.files.filter(file=>file.keep||importFileGroup(file)).map(file=>file.path)));
   const [archiveChoices,setArchiveChoices] = useState<Partial<Record<ArchiveName,boolean>>>({});
   const [filter,setFilter] = useState('');
   const [page,setPage] = useState(0);
@@ -599,24 +615,49 @@ function ImportView({plan,working,close,addFolders,addFiles,publish}:{
       return plan.files.find(file=>file.sourcePath===source)?.path ?? plan.preview ?? '';
     });
     setSelected(current=>{
-      const previousSelections = new Map(previous.files.map(file=>[file.sourcePath,current.has(file.path)]));
-      return new Set(plan.files.filter(file=>previousSelections.get(file.sourcePath)??file.keep).map(file=>file.path));
+      const previousFiles = new Map(previous.files.map(file=>[file.sourcePath,file]));
+      const previousGroups = new Map<ImportFileGroup,boolean>();
+      for (const file of previous.files) {
+        const group = importFileGroup(file);
+        if (group) previousGroups.set(group,Boolean(previousGroups.get(group)||current.has(file.path)));
+      }
+      return new Set(plan.files.filter(file=>{
+        const group = importFileGroup(file);
+        const old = previousFiles.get(file.sourcePath);
+        if (old && (!group||importFileGroup(old)===group)) return current.has(old.path);
+        return group ? previousGroups.get(group)!==false : file.keep;
+      }).map(file=>file.path));
     });
     setPage(0);
   },[plan]);
   const search = filter.trim().toLowerCase();
   const visible = search ? plan.rows.filter(row=>row.label.toLowerCase().includes(search) ||
     row.archiveLabel.toLowerCase().includes(search) || row.paths.some(file=>file.toLowerCase().includes(search))) : plan.rows;
+  const groupPaths:Record<ImportFileGroup,string[]> = {render:[],abc:[]};
+  for (const file of plan.files) {
+    const group = importFileGroup(file);
+    if (group) groupPaths[group].push(file.path);
+  }
   const chosen = plan.files.filter(file=>selected.has(file.path));
   const sizes = archiveSizes(chosen);
-  const availableArchives = [...new Set<ArchiveName>([...archiveNames,...sizes.keys()])].filter(name=>sizes.has(name));
-  const archives = availableArchives.filter(name=>archiveChoices[name] ?? true);
+  const archiveOptions = [...new Set<ArchiveName>([...archiveNames,...archiveSizes(plan.files).keys()])];
+  const archives = archiveOptions.filter(name=>sizes.has(name)&&(archiveChoices[name]??true));
+  const previewSrc = plan.files.some(file=>file.path===preview&&file.kind==='movie')
+    ? `vfx-media://scan-preview/${plan.id}?${new URLSearchParams({path:preview})}` : '';
+  const selectPaths = (paths:string[],checked:boolean)=>setSelected(previous=>{
+    const next = new Set(previous);
+    for (const file of paths) {
+      if (checked) next.add(file);
+      else next.delete(file);
+    }
+    return next;
+  });
   return <form className="import" onSubmit={event=>{
     event.preventDefault();
     if (working || !selected.has(preview)) return;
     const next = mergeTags(tags,tagDraft);
     setTags(next);setTagDraft('');
-    publish(title,next,preview,[...selected],archives);
+    publish(title,next,preview,chosen.map(file=>file.path),archives);
   }}>
     <div className="content import-scroll">
       <div className="import-sources">
@@ -635,36 +676,46 @@ function ImportView({plan,working,close,addFolders,addFiles,publish}:{
           setTags(next);
           if (submitted) setTagDraft('');
         }} onDraft={setTagDraft}/>
-        <label>主预览 MOV<select required value={preview} onChange={e=>{
-          setPreview(e.target.value);setSelected(old=>new Set([...old,e.target.value]));
-        }}><option value="">请选择</option>{plan.files.filter(file=>file.kind==='movie').map(file=><option key={file.path}>{file.path}</option>)}</select></label>
+        <div className="import-preview">
+          <label>主预览 MOV<select required value={preview} onChange={e=>{
+            const value = e.target.value;
+            setPreview(value);setPreviewError('');
+            if (value) setSelected(old=>new Set([...old,value]));
+          }}><option value="">请选择</option>{plan.files.filter(file=>file.kind==='movie').map(file=><option key={file.path}>{file.path}</option>)}</select></label>
+          {previewSrc&&<TemplateVideo key={previewSrc} src={previewSrc} controls loop onError={()=>setPreviewError(previewSrc)}/>}
+          {previewSrc&&previewError===previewSrc&&<p className="warning" role="status">无法播放此 MOV，请检查源文件和视频编码。</p>}
+        </div>
       </div>
-      <div className="library-head"><span>保留 {selected.size} / {plan.files.length} 个文件 · {bytes(chosen.reduce((sum,file)=>sum+file.bytes,0))} · {plan.sequences.length} 组候选序列</span>
+      <div className="library-head"><span>保留 {chosen.length} / {plan.files.length} 个文件 · {bytes(chosen.reduce((sum,file)=>sum+file.bytes,0))} · {plan.sequences.length} 组候选序列</span>
         <input type="search" placeholder="筛选相对路径" aria-label="筛选相对路径" value={filter} onChange={e=>{setFilter(e.target.value);setPage(0);}}/></div>
-      {availableArchives.length>0&&<div className="toolbar archive-options">
-        {availableArchives.map(name=><label key={name}>
-          <input type="checkbox" checked={archives.includes(name)} disabled={working} onChange={event=>{
+      <div className="toolbar archive-options" role="group" aria-label="入库文件类型">
+        <span className="muted">入库内容</span>
+        {importFileGroups.map(({id,label})=>{
+          const paths = groupPaths[id];
+          const all = paths.length>0&&paths.every(file=>selected.has(file));
+          const some = !all&&paths.some(file=>selected.has(file));
+          return <label key={id}>
+            <input type="checkbox" checked={all} disabled={working||!paths.length}
+              ref={input=>{if(input) input.indeterminate=some;}}
+              onChange={event=>selectPaths(paths,event.target.checked)}/><span>{label}</span>
+          </label>;
+        })}
+      </div>
+      <div className="toolbar archive-options" role="group" aria-label="入库压缩选项">
+        {archiveOptions.map(name=><label key={name}>
+          <input type="checkbox" checked={archives.includes(name)} disabled={working||!sizes.has(name)} onChange={event=>{
             const checked = event.target.checked;
             setArchiveChoices(previous=>({...previous,[name]:checked}));
-          }}/><span title={name}>压缩为 {name}（{bytes(sizes.get(name)??0)}）</span>
+          }}/><span title={name}>压缩为 {name}{sizes.has(name)&&`（${bytes(sizes.get(name)??0)}）`}</span>
         </label>)}
-      </div>}
+      </div>
       <div className="file-list">
         {visible.slice(page*100,page*100+100).map(row=>{
           const all = row.paths.every(file=>selected.has(file));
           const some = !all && row.paths.some(file=>selected.has(file));
           return <label className="file-row" key={row.paths[0]}>
-            <input type="checkbox" checked={all} disabled={working} ref={input=>{if(input) input.indeterminate=some;}} onChange={event=>{
-              const checked=event.target.checked;
-              setSelected(old=>{
-                const next = new Set(old);
-                for (const file of row.paths) {
-                  if (checked) next.add(file);
-                  else next.delete(file);
-                }
-                return next;
-              });
-            }}/>
+            <input type="checkbox" checked={all} disabled={working} ref={input=>{if(input) input.indeterminate=some;}}
+              onChange={event=>selectPaths(row.paths,event.target.checked)}/>
             <span className="file-location">
               <span title={row.label}>{row.label}</span>
               {row.archiveLabel!==row.label&&<small title={row.archiveLabel}>归档到 {row.archiveLabel}</small>}
@@ -717,7 +768,7 @@ function Detail({item,working,close,setTags,setDescription,exportPackage,moveToT
 
   return <aside className="detail">
     <div className="detail-head"><h2>{item.title}</h2><button onClick={close} aria-label="关闭模板详情">×</button></div>
-    <TemplateVideo id={item.id} controls onError={()=>setMediaError(true)}/>
+    <TemplateVideo src={`vfx-media://preview/${item.id}`} controls onError={()=>setMediaError(true)}/>
     {mediaError&&<p className="warning">当前桌面播放器无法预览此 MOV，可通过模板包打开原文件。</p>}
     <div className="detail-fields">
       <TagField tags={item.tags} draft={tagDraft} disabled={working||savingTags}

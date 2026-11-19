@@ -4,7 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { Transform, type PassThrough } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
-import Fastify, { LogController } from 'fastify';
+import Fastify, { LogController, type FastifyReply } from 'fastify';
 import { ZipFile } from 'yazl';
 import type { DesktopProgress, PublishInput, Settings } from '../contracts';
 import { openLibrary, type Library } from './library';
@@ -227,10 +227,8 @@ export function createServer(options: {
     try { return {ok:true,result:await current.restoreDatabase(request.body.file)}; }
     finally { configuring = false; }
   });
-  app.get<{Params:{id:string}}>('/templates/:id/preview',{schema:{params:idParams}},async (request,reply) => {
-    const {file,bytes} = await active().preview(request.params.id);
+  const sendPreview = (reply: FastifyReply, range: string | undefined, {file,bytes}: {file:string;bytes:number}) => {
     void reply.type('video/quicktime').header('accept-ranges','bytes');
-    const range = request.headers.range;
     if (range) {
       const match = /^bytes=(\d*)-(\d*)$/.exec(range);
       const start = match?.[1] ? Number(match[1]) : Math.max(0,bytes-Number(match?.[2]));
@@ -242,6 +240,14 @@ export function createServer(options: {
         .send(createReadStream(file,{start,end}));
     }
     return reply.header('content-length',bytes).send(createReadStream(file));
+  };
+  app.get<{Params:{id:string}}>('/templates/:id/preview',{schema:{params:idParams}},async (request,reply) => {
+    return sendPreview(reply,request.headers.range,await active().preview(request.params.id));
+  });
+  app.get<{Params:{id:string};Querystring:{path:string}}>('/scan/:id/preview',{
+    schema:{params:idParams,querystring:allRequired({path:shortStringWithPath()})},
+  },async (request,reply) => {
+    return sendPreview(reply,request.headers.range,await active().scanPreview(request.params.id,request.query.path));
   });
 
   app.get<{Params:{id:string};Querystring:{mode:'slim'|'full'}}>('/templates/:id/package',{
@@ -263,6 +269,7 @@ export function createServer(options: {
     archive.on('error',error => {
       failed = true;
       log.error({err:error},'export.archive_failed');
+      abort.abort();
       (archive.outputStream as PassThrough).destroy(error);
     });
     reply.raw.once('finish',() => {
@@ -286,7 +293,7 @@ export function createServer(options: {
         });
         callback(null,verified);
         void pipeline(createReadStream(instance.filePath(template,file.path)),verified,{signal:abort.signal}).catch(error => {
-          if (!abort.signal.aborted) log.error({err:error,file:file.path},'export.file_failed');
+          if (!abort.signal.aborted) archive.emit('error',error);
         });
       });
     }
