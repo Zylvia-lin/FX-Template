@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { archiveNames, archiveSizes } from '../contracts';
-import type { ArchiveName, ArchiveProgress, CatalogFilters, DesktopApi, DesktopProgress, PackCandidate, PackExistingResult, PackProgress, Plan, Settings, SourceFile, Template, TemplateDetail } from '../contracts';
+import type { ArchiveName, ArchiveProgress, CatalogFilters, CompressionProgress, DesktopApi, PackCandidate, PackExistingResult, PackProgress, Plan, PublishInput, Settings, SourceFile, Template, TemplateDetail } from '../contracts';
 import './style.css';
 
 declare global { interface Window {vfx: DesktopApi;} }
@@ -61,6 +61,8 @@ function useBanner() {
   return [message?.text??'',show] as const;
 }
 
+type PublishJob = {id:string;title:string;error?:string};
+
 function App() {
   const [status,setStatus] = useState<Awaited<ReturnType<DesktopApi['status']>>>();
   const [panel,setPanel] = useState<'library'|'settings'|'trash'|'toolbox'>('library');
@@ -82,7 +84,9 @@ function App() {
   const [notice,setNotice] = useBanner();
   const [revision,setRevision] = useState(0);
   const [dragging,setDragging] = useState(false);
-  const [progress,setProgress] = useState<DesktopProgress>();
+  const [publishJobs,setPublishJobs] = useState<PublishJob[]>([]);
+  const [archiveProgress,setArchiveProgress] = useState<ArchiveProgress>();
+  const [packProgress,setPackProgress] = useState<PackProgress>();
   const changeCardZoom = useCallback((step:number)=>{
     setCardZoom(previous=>Math.min(maxCardZoom,Math.max(0,previous+step)));
   },[]);
@@ -97,7 +101,10 @@ function App() {
       filterSnapshot.current = JSON.stringify(saved);
       setMode(saved.mode);setActiveTags(saved.tags);setStatus(current);
     }).catch(err=>setError(errorText(err)));
-    return api.onProgress(setProgress);
+    return api.onProgress(event=>{
+      if ('type' in event) setPackProgress(event);
+      else setArchiveProgress(event);
+    });
   },[]);
   useEffect(()=>{
     if (!status?.configured) return;
@@ -142,7 +149,7 @@ function App() {
     setBusy(label);setError('');setNotice('');
     try {return await callback();}
     catch (err) {setError(errorText(err));}
-    finally {setBusy('');setProgress(undefined);}
+    finally {setBusy('');setPackProgress(undefined);}
   }
   function saveMetadata(label:string, update:()=>Promise<void>) {
     const save = pendingMetadata.current.then(async()=>{
@@ -164,9 +171,24 @@ function App() {
   const importPaths = (getPaths:()=>Promise<string[]>,append=false) => action('正在扫描项目',async()=>{
     const paths = await getPaths();
     if (!paths.length) return;
+    const scanned = await api.scan(paths,append?plan?.id:undefined);
+    if (trashOpen) {setItems([]);setPage(0);}
     setSelected(undefined);
-    setPlan(await api.scan(paths,append?plan?.id:undefined));
+    setPanel('library');setPlan(scanned);
   });
+  const enqueuePublish = (input:PublishInput) => {
+    const {id,title} = input;
+    setPublishJobs(jobs=>[...jobs,{id,title}]);
+    setPlan(undefined);
+    void api.publish(input).then(template=>{
+      setPublishJobs(jobs=>jobs.filter(job=>job.id!==id));
+      setRevision(value=>value+1);
+      setNotice('「'+template.title+'」已入库');
+    }).catch(err=>{
+      const error = errorText(err);
+      setPublishJobs(jobs=>jobs.map(job=>job.id===id ? {...job,error} : job));
+    });
+  };
   const folders = () => importPaths(()=>api.pickDirectories());
   const save = (settings:Settings) => action('正在检查目录和数据库',async()=>{
     await api.configure(settings);
@@ -207,12 +229,12 @@ function App() {
   const toolboxOpen = panel==='toolbox' && Boolean(status?.configured);
   const libraryOpen = !settingsOpen&&!trashOpen&&!toolboxOpen;
   return <div className="shell" onDragOver={event=>{
-    if (status?.configured && libraryOpen && !busy && event.dataTransfer.types.includes('Files')) {
+    if (status?.configured && !busy && event.dataTransfer.types.includes('Files')) {
       event.preventDefault();setDragging(true);
     }
   }} onDrop={event=>{
     event.preventDefault();setDragging(false);
-    if(status?.configured&&libraryOpen&&!busy) {
+    if(status?.configured&&!busy) {
       const paths = api.pathsForDrop(Array.from(event.dataTransfer.files));
       void importPaths(async()=>paths,Boolean(plan));
     }
@@ -249,11 +271,11 @@ function App() {
       </header>
       {error&&<div role="alert" className="banner error">{error}<button onClick={()=>setError('')} aria-label="关闭错误">×</button></div>}
       {notice&&<div role="status" className="banner">{notice}<button onClick={()=>setNotice('')} aria-label="关闭提示">×</button></div>}
-      {busy&&(progress && 'type' in progress && toolboxOpen
-        ? <PackStatus progress={progress}/>
-        : progress && 'id' in progress && plan?.id===progress.id
-          ? <ArchiveStatus progress={progress}/>
-          : <div className="busy" role="status">{busy}</div>)}
+      {publishJobs.length>0&&<PublishQueue jobs={publishJobs} progress={archiveProgress}
+        dismiss={id=>setPublishJobs(jobs=>jobs.filter(job=>job.id!==id))}/>}
+      {busy&&(packProgress && toolboxOpen
+        ? <PackStatus progress={packProgress}/>
+        : <div className="busy" role="status">{busy}</div>)}
       {settingsOpen&&<SettingsView key={String(status?.configured)} initial={{...defaults,...status?.settings}} warning={status?.warning}
         working={Boolean(busy)} connected={Boolean(status?.configured)} save={save} backup={backup}
         migrate={migrateStorage} restoreDatabase={restoreDatabase}/>}
@@ -265,12 +287,7 @@ function App() {
       {libraryOpen&&plan&&<ImportView plan={plan} working={Boolean(busy)} close={()=>setPlan(undefined)}
         addFolders={()=>void importPaths(()=>api.pickDirectories(),true)}
         addFiles={()=>void importPaths(()=>api.pickSource(),true)}
-        publish={(title,tags,preview,paths,archives)=>void action('正在归档模板',async()=>{
-        const template=await api.publish({id:plan.id,title,tags,preview,paths,archives});
-        setPlan(undefined);setSearch('');setPage(0);setRevision(value=>value+1);
-        setSelected(await api.detail(template.id));
-        setNotice('模板已入库');
-      })}/>}
+        publish={(title,tags,preview,paths,archives)=>enqueuePublish({id:plan.id,title,tags,preview,paths,archives})}/>}
       {trashOpen&&status?.configured&&<section className="content trash-list">
         {pagination}
         {pageLoading?<p role="status">正在加载回收站…</p>:items.length===0?<div className="empty"><h2>回收站为空</h2></div>:items.map(item=><div key={item.id} className="trash-row">
@@ -407,21 +424,54 @@ function TemplateVideo({src,controls=false,loop=!controls,onError}:{src:string;c
     src={src} onError={onError}/>;
 }
 
-function ArchiveStatus({progress}: {progress:ArchiveProgress}) {
-  const {stage,completed,total,bytesCopied,totalBytes,elapsedMs,currentFile} = progress;
-  const percent = Math.min(100,Math.floor(100*(totalBytes ? bytesCopied/totalBytes : completed/total)));
-  const amount = (value:number) => value ? bytes(value) : '0 B';
-  return <section className="busy archive-progress" aria-label="归档进度">
+function PublishQueue({jobs,progress,dismiss}:{
+  jobs:PublishJob[];progress?:ArchiveProgress;dismiss:(id:string)=>void;
+}) {
+  const pending = jobs.filter(job=>job.error===undefined);
+  const failed = jobs.filter(job=>job.error!==undefined);
+  const [active,...waiting] = pending;
+  return <section className="busy archive-progress" aria-label="入库队列">
     <div className="archive-progress-heading">
-      <strong>{stage==='copy'?'正在复制并校验文件':stage==='pack'?'正在压缩素材':'正在登记模板'}</strong>
-      <span>{stage==='copy'?`${percent}%`:'文件已复制'}</span>
+      <strong>入库队列</strong>
+      <span role="status">{active?'正在入库 1 个':''}{waiting.length>0&&` · 等待 ${waiting.length} 个`}
+        {failed.length>0&&`${active?' · ':''}失败 ${failed.length} 个`}</span>
     </div>
-    <progress aria-label="文件复制进度" value={percent} max={100}/>
-    <p>已完成 {completed} / {total} 个文件 · {amount(bytesCopied)} / {amount(totalBytes)}
-      {stage==='copy' && elapsedMs>=1000 && bytesCopied>0 && ` · 平均 ${bytes(bytesCopied*1000/elapsedMs)}/s`}
-    </p>
-    {currentFile&&<p className="archive-current" title={currentFile.path}>正在处理 {currentFile.path} · {amount(currentFile.bytesCopied)} / {amount(currentFile.totalBytes)}</p>}
+    {active&&<p className="archive-current" title={active.title}>{active.title}</p>}
+    {active && (progress?.id===active.id ? <ArchiveStatus progress={progress}/> : <p>正在准备入库…</p>)}
+    {(waiting.length>0 || failed.length>0)&&<details className="publish-queue-details">
+      <summary>查看等待和失败的模板</summary>
+      <ul>{waiting.map(job=><li key={job.id}>{job.title} · 等待入库</li>)}
+        {failed.map(job=><li key={job.id}>{job.title} · {job.error}
+          <button type="button" onClick={()=>dismiss(job.id)} aria-label={`移除失败记录 ${job.title}`}>移除</button>
+        </li>)}</ul>
+    </details>}
   </section>;
+}
+
+const progressBytes = (value:number) => value ? bytes(value) : '0 B';
+
+function CompressionMeter({progress}: {progress:CompressionProgress}) {
+  const {archive,bytesRead,totalBytes,complete} = progress;
+  const percent = complete ? 100 : totalBytes ? Math.min(99,Math.floor(100*bytesRead/totalBytes)) : 0;
+  return <>
+    <progress aria-label="素材压缩进度" value={percent} max={100}/>
+    <p className="archive-current" title={archive}>{archive} · {progressBytes(bytesRead)} / {progressBytes(totalBytes)} · {percent}%</p>
+  </>;
+}
+
+function ArchiveStatus({progress}: {progress:ArchiveProgress}) {
+  const {stage,completed,total,bytesCopied,totalBytes,elapsedMs,currentFile,compression} = progress;
+  if (stage==='pack' && compression) return <><p>正在压缩素材</p><CompressionMeter progress={compression}/></>;
+  if (stage==='register') return <p>正在登记模板</p>;
+  const percent = Math.min(100,Math.floor(100*(totalBytes ? bytesCopied/totalBytes : completed/total)));
+  return <>
+    <p>正在复制并校验文件 · {percent}%</p>
+    <progress aria-label="文件复制进度" value={percent} max={100}/>
+    <p>已完成 {completed} / {total} 个文件 · {progressBytes(bytesCopied)} / {progressBytes(totalBytes)}
+      {elapsedMs>=1000 && bytesCopied>0 && ` · 平均 ${bytes(bytesCopied*1000/elapsedMs)}/s`}
+    </p>
+    {currentFile&&<p className="archive-current" title={currentFile.path}>正在处理 {currentFile.path} · {progressBytes(currentFile.bytesCopied)} / {progressBytes(currentFile.totalBytes)}</p>}
+  </>;
 }
 
 function PackStatus({progress}: {progress:PackProgress}) {
@@ -436,10 +486,12 @@ function PackStatus({progress}: {progress:PackProgress}) {
     {current&&<>
       <p className="archive-current" title={current.title}>{current.title} · {
         current.stage==='copy' ? '正在复制并校验散文件'
-          : current.stage==='pack' ? `正在压缩 ${current.archive}` : '正在登记新版本'
+          : current.stage==='pack' ? '正在压缩素材' : '正在登记新版本'
       }</p>
-      <progress aria-label="当前模板素材处理进度" value={percent} max={100}/>
-      <p>已读取 {current.bytesRead ? bytes(current.bytesRead) : '0 B'} / {current.totalBytes ? bytes(current.totalBytes) : '0 B'} · {percent}%</p>
+      {current.compression ? <CompressionMeter progress={current.compression}/> : <>
+        <progress aria-label="当前模板素材处理进度" value={percent} max={100}/>
+        <p>已读取 {progressBytes(current.bytesRead)} / {progressBytes(current.totalBytes)} · {percent}%</p>
+      </>}
     </>}
     {(skipped>0||failed>0)&&<p>已压缩 {packed} 个 · 跳过 {skipped} 个 · 失败 {failed} 个</p>}
   </section>;

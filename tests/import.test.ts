@@ -366,7 +366,7 @@ test('PostgreSQL 导入、同名隔离、标签、范围预览、打包与数据
   for (const tags of [['写实','烟尘'],['写实','火焰']]) {
     const scanned = await request('POST','/scan',{paths:ids.length?[source,extraCache]:[source]});
     assert.equal(scanned.statusCode,200,scanned.body);
-    const plan = scanned.json();
+    const plan = scanned.json<Plan>();
     const paths = plan.files.filter((file:{keep:boolean;path:string})=>file.keep||file.path.startsWith('add_file/')||file.path==='houdini/geo/sim.bgeo.sc').map((file:{path:string})=>file.path);
     const result = await request('POST','/publish',{id:plan.id,title:'同名',tags,preview:plan.preview,paths,
       archives:ids.length ? [] : ['render.zip','abc.zip','tex/Dan/DPCD.zip']});
@@ -377,6 +377,16 @@ test('PostgreSQL 导入、同名隔离、标签、范围预览、打包与数据
     const last = updates.at(-1)!;
     assert.equal(last.stage,'register');
     assert.equal(updates.some(update=>update.stage==='pack'),ids.length===0);
+    if (!ids.length) {
+      const compression = updates.flatMap(update=>update.compression ? [update.compression] : []);
+      const totalBytes = plan.files.filter(file=>file.archiveZip && paths.includes(file.path))
+        .reduce((sum,file)=>sum+file.bytes,0);
+      assert.equal(compression[0].bytesRead,0);
+      assert.equal(compression[0].complete,false);
+      assert.equal(compression.at(-1)?.totalBytes,totalBytes);
+      assert.equal(compression.at(-1)?.bytesRead,totalBytes);
+      assert.equal(compression.at(-1)?.complete,true);
+    }
     assert.equal(last.completed,paths.length);
     assert.equal(last.bytesCopied,last.totalBytes);
     if (!ids.length) publishedVersion = result.json().version;
@@ -501,7 +511,13 @@ test('PostgreSQL 导入、同名隔离、标签、范围预览、打包与数据
   packProgress.length = 0;
   const packed = (await request('POST',toolsRoute,{ids:[legacy.id]})).json();
   assert.deepEqual(packed,{packed:1,skipped:0,failed:[]});
-  assert.deepEqual([...new Set(packProgress.flatMap(event=>event.current?.archive?[event.current.archive]:[]))],['render.zip','abc.zip',textureZip]);
+  const packedUpdates = packProgress.flatMap(event=>event.current?.compression ? [event.current.compression] : []);
+  assert.equal(packedUpdates[0].archive,'render.zip');
+  assert.equal(packedUpdates[0].bytesRead,0);
+  assert.equal(packedUpdates[0].complete,false);
+  assert.equal(packedUpdates.at(-1)?.archive,textureZip);
+  assert.equal(packedUpdates.at(-1)?.bytesRead,packedUpdates[0].totalBytes);
+  assert.equal(packedUpdates.at(-1)?.complete,true);
   const registration = packProgress.find(event=>event.current?.stage==='register')?.current;
   assert.equal(registration?.title,legacy.title);
   assert.equal(registration?.bytesRead,legacy.bytes);
@@ -583,6 +599,46 @@ test('PostgreSQL 导入、同名隔离、标签、范围预览、打包与数据
   const retry = await request('POST','/publish',{...publishInput,title:'登记重试'});
   assert.equal(retry.statusCode,200,retry.body);
   assert.equal((await request('POST','/publish',{...publishInput,title:'登记重试'})).statusCode,400);
+
+  const scanQueuePlan = async () => (await request('POST','/scan',{paths:[source]})).json<Plan>();
+  const first = await scanQueuePlan();
+  const locker = new pg.Client({host:'127.0.0.1',port,user:'vfx_test',database});
+  await locker.connect();
+  const queued: Promise<Awaited<ReturnType<typeof request>>>[] = [];
+  const submitted: string[] = [];
+  const enqueue = (plan:Plan,title:string) => {
+    submitted.push(plan.id);
+    queued.push(Promise.resolve(request('POST','/publish',{...publishInput,id:plan.id,title})));
+  };
+  try {
+    await locker.query('BEGIN');
+    await locker.query('LOCK TABLE vfx_templates IN SHARE MODE');
+    enqueue(first,'队列第一项');
+    for (let attempt=0;attempt<100&&!progress.some(event=>event.id===first.id&&event.stage==='register');attempt++) {
+      await new Promise(resolve=>setTimeout(resolve,20));
+    }
+    assert.ok(progress.some(event=>event.id===first.id&&event.stage==='register'));
+    assert.equal((await request('POST','/library',{search:'同名',tags:[],mode:'any'})).statusCode,200);
+    const second = await scanQueuePlan();
+    enqueue(second,'模拟登记失败');
+    const third = await scanQueuePlan();
+    enqueue(third,'队列第三项');
+    for (let scans=0;scans<9;scans++) await scanQueuePlan();
+    const duplicate = await request('POST','/publish',{...publishInput,id:second.id});
+    assert.equal(duplicate.statusCode,400);
+    assert.match(duplicate.json().message,/正在发布/);
+    assert.equal(progress.some(event=>event.id===second.id||event.id===third.id),false);
+  } finally {
+    await locker.query('ROLLBACK');
+    await locker.end();
+  }
+  const queueResults = await Promise.all(queued);
+  assert.deepEqual(queueResults.map(response=>response.statusCode),[200,400,200]);
+  assert.equal(queueResults[0].json<Template>().title,'队列第一项');
+  assert.equal(queueResults[2].json<Template>().title,'队列第三项');
+  assert.deepEqual([...new Set(progress.map(event=>event.id).filter(id=>submitted.includes(id)))],submitted);
+  assert.deepEqual(await readdir(path.join(root,'staging')),[]);
+
   const backup = await request('POST','/backup');
   assert.equal(backup.statusCode,200,backup.body);
   assert.equal((await readFile(backup.json().file)).subarray(0,5).toString(),'PGDMP');

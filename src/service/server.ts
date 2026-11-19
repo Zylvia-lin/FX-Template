@@ -37,6 +37,7 @@ export function createServer(options: {
   let backups: Backups | undefined;
   let warning: string | undefined;
   let configuring = false;
+  let reconnecting = false;
   let migrating = false;
   let importing = 0;
   app.addHook('onRequest',async (request,reply) => {
@@ -92,7 +93,11 @@ export function createServer(options: {
       if (library && settings && ['root','host','port','database','user'].some(key => next[key as keyof Settings] !== settings![key as keyof Settings])) {
         throw new Error('已配置的库需通过迁移流程更换连接或目录');
       }
-      if (!library || next.password !== settings?.password) opened = await openLibrary(next,app.log,!library);
+      if (!library || next.password !== settings?.password) {
+        if (importing) throw new Error('请等待模板扫描和入库队列完成后再更新数据库连接');
+        reconnecting = true;
+        opened = await openLibrary(next,app.log,!library);
+      }
       await options.saveSettings(next);
       const old = library;
       if (opened) library = opened;
@@ -105,7 +110,7 @@ export function createServer(options: {
     } catch (error) {
       if (opened && opened !== library) await opened.close();
       throw error;
-    } finally { configuring = false; }
+    } finally { configuring = reconnecting = false; }
   });
   app.post<{Body:{root:string}}>('/settings/migrate-storage',{
     schema:{body:allRequired({root:shortStringWithPath()})},
@@ -133,6 +138,7 @@ export function createServer(options: {
     properties:{paths:{type:'array',minItems:1,maxItems:100,items:shortStringWithPath()},previousPlanId:uuid},
   }}},async request => {
     if (migrating) throw new Error('素材库正在迁移，请稍后再扫描');
+    if (reconnecting) throw new Error('数据库连接正在更新，请稍后再扫描');
     importing++;
     try { return await active().scan(request.body.paths,request.body.previousPlanId); }
     finally { importing--; }
@@ -160,6 +166,7 @@ export function createServer(options: {
       archives:{type:'array',uniqueItems:true,items:{...shortStringWithPath(),pattern:'\\.zip$'}}},
   }}},async request => {
     if (migrating) throw new Error('素材库正在迁移，请稍后再入库');
+    if (reconnecting) throw new Error('数据库连接正在更新，请稍后再入库');
     if (!request.body.title.trim()) throw new Error('请输入模板名称');
     importing++;
     try { return await active().publish(request.body,options.progress); }

@@ -150,15 +150,22 @@ async function start() {
     properties:['openFile','multiSelections'],
   })).filePaths);
   handle('scan',(paths:string[],previousPlanId?:string) => json('/scan','POST',{paths,previousPlanId}));
+  const pendingPublishes = new Set<Promise<unknown>>();
+  let waitingToQuit = false;
   handle('publish',async (input:PublishInput) => {
+    if (waitingToQuit) return {ok:false,message:'应用将在入库队列完成后退出'};
     // Archiving may outlast HTTP header timeouts. This service already runs in the desktop process.
-    const response = await service.app.inject({
+    const pending = service.app.inject({
       method:'POST',url:'/publish',headers:{authorization:`Bearer ${token}`},payload:input,
     });
-    const result = response.json();
-    return response.statusCode < 400
-      ? {ok:true,template:result as Template}
-      : {ok:false,message:result.message ?? `归档失败（${response.statusCode}）`};
+    pendingPublishes.add(pending);
+    try {
+      const response = await pending;
+      const result = response.json();
+      return response.statusCode < 400
+        ? {ok:true,template:result as Template}
+        : {ok:false,message:result.message ?? `归档失败（${response.statusCode}）`};
+    } finally { pendingPublishes.delete(pending); }
   });
   handle('list',(input:Parameters<DesktopApi['list']>[0]) => json('/library','POST',input));
   handle('detail',(id:string) => json(`/templates/${encodeURIComponent(id)}`));
@@ -246,10 +253,17 @@ async function start() {
   }
   app.on('second-instance',()=>{window?.show();window?.focus();});
   app.on('before-quit',event => {
-    const pending = libraryMaintenance ?? catalogFilters.pendingWrite();
+    const pending = pendingPublishes.size ? Promise.allSettled(pendingPublishes)
+      : libraryMaintenance ?? catalogFilters.pendingWrite();
     if (pending) {
       event.preventDefault();
-      void pending.then(()=>app.quit(),()=>app.quit());
+      if (!waitingToQuit) {
+        waitingToQuit = true;
+        void pending.finally(()=>{
+          waitingToQuit = false;
+          app.quit();
+        }).catch(()=>undefined);
+      }
       return;
     }
     quitting = true;

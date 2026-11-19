@@ -8,7 +8,7 @@ import { constants as zlib } from 'node:zlib';
 import pg from 'pg';
 import { ZipFile } from 'yazl';
 import type { FastifyBaseLogger } from 'fastify';
-import type { ArchiveName, ArchiveProgress, PackCandidate, PackExistingResult, PackProgress, Plan, PublishInput, Settings, Template, TemplateDetail } from '../contracts';
+import type { ArchiveName, ArchiveProgress, CompressionProgress, PackCandidate, PackExistingResult, PackProgress, Plan, PublishInput, Settings, Template, TemplateDetail } from '../contracts';
 import { archiveNames } from '../contracts';
 import { nativePath, renderSequencePaths, scanSources, sequencesFor, textureSequenceArchives } from './scanner';
 import { restoreDatabaseBackup } from './restore';
@@ -262,6 +262,30 @@ async function packArchive(directory:string, destination:string, entries:Templat
   return {bytes,sha256:hash.digest('hex')};
 }
 
+async function packArchives(archives:Map<ArchiveName,TemplateDetail['manifest']>, source:(name:ArchiveName)=>string,
+  project:string, manifest:TemplateDetail['manifest'], progress:(value:CompressionProgress)=>void) {
+  let totalBytes = 0;
+  for (const entries of archives.values()) for (const entry of entries) totalBytes += entry.bytes;
+  let bytesRead = 0;
+  let remaining = archives.size;
+  let lastUpdate = -Infinity;
+  const report = (archive:ArchiveName,complete = false) => {
+    const now = performance.now();
+    if (!complete && now-lastUpdate<1000) return;
+    lastUpdate = now;
+    progress({archive,bytesRead,totalBytes,complete});
+  };
+  for (const [name,entries] of archives) {
+    report(name);
+    const archive = await packArchive(source(name),nativePath(project,name),entries,count=>{
+      bytesRead += count;
+      report(name);
+    });
+    manifest.push({path:name,kind:'other',...archive,entries});
+    if (--remaining===0) report(name,true);
+  }
+}
+
 function containsDirectory(parent:string, child:string) {
   const relative = path.relative(parent,child);
   return relative === '' || (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith('..'+path.sep));
@@ -270,6 +294,7 @@ function containsDirectory(parent:string, child:string) {
 export class Library {
   private plans = new Map<string, Plan>();
   private publishing = new Set<string>();
+  private publishTail = Promise.resolve();
 
   constructor(private pool: pg.Pool, private directory: string, readonly id: string, private log: FastifyBaseLogger) {}
 
@@ -391,12 +416,17 @@ export class Library {
 
   async scan(inputs: string[], previousPlanId?: string) {
     const start = performance.now();
+    if (previousPlanId && this.publishing.has(previousPlanId)) throw new Error('此导入清单已提交发布');
     const previous = previousPlanId ? this.plans.get(previousPlanId) : undefined;
     if (previousPlanId && !previous) throw new Error('导入清单已经失效，请重新扫描');
     const sources = previous ? [...new Set([...previous.sources,...inputs])] : inputs;
     const plan = await scanSources(sources,this.root,previous?.scanRoots);
     if (previous) this.plans.delete(previous.id);
-    if (this.plans.size >= 8) this.plans.delete(this.plans.keys().next().value!);
+    if (this.plans.size >= 8) {
+      for (const id of this.plans.keys()) {
+        if (!this.publishing.has(id)) {this.plans.delete(id);break;}
+      }
+    }
     this.plans.set(plan.id, plan);
     this.log.info({module:'import', taskId: plan.id, sourceCount: inputs.length, files: plan.files.length,
       selectedFiles: plan.files.filter(file => file.keep).length, sequences: plan.sequences.length,
@@ -418,6 +448,14 @@ export class Library {
     const plan = this.plans.get(input.id);
     if (!plan) throw new Error('导入清单已经失效，请重新扫描');
     if (this.publishing.has(input.id)) throw new Error('此导入清单正在发布');
+    this.publishing.add(input.id);
+    const result = this.publishTail.then(()=>this.publishPlan(plan,input,progress));
+    this.publishTail = result.then(()=>undefined,()=>undefined);
+    try { return await result; }
+    finally { this.publishing.delete(input.id); }
+  }
+
+  private async publishPlan(plan:Plan,input:PublishInput,progress:(event:ArchiveProgress)=>void):Promise<Template> {
     const paths = new Set(input.paths);
     const files = plan.files.filter(item => paths.has(item.path));
     if (paths.size !== files.length) throw new Error('选择中有未经扫描的路径');
@@ -478,6 +516,7 @@ export class Library {
     const totalBytes = files.reduce((sum,file)=>sum+file.bytes,0);
     let stage: ArchiveProgress['stage'] = 'copy';
     let currentFile: ArchiveProgress['currentFile'];
+    let compression: CompressionProgress | undefined;
     let bytesCopied = 0;
     let completed = 0;
     let lastUpdate = -Infinity;
@@ -491,10 +530,9 @@ export class Library {
       if (!force && now-lastUpdate < 200) return;
       lastUpdate = now;
       progress({id:input.id,stage,completed,total:files.length,bytesCopied,totalBytes,
-        elapsedMs:Math.round(now-started),currentFile:currentFile && {...currentFile}});
+        elapsedMs:Math.round(now-started),currentFile:currentFile && {...currentFile},compression});
     };
     logger.info({files:files.length,totalBytes,relocatedFiles:files.filter(file=>file.path!==file.archivePath).length},'import.publish_started');
-    this.publishing.add(input.id);
     try {
       client = await this.pool.connect();
       client.on('error',onDatabaseError);
@@ -540,15 +578,15 @@ export class Library {
         .map(file=>({path:file.archivePath,kind:file.kind})));
       if (packed.size) {
         stage = 'pack';
-        reportProgress(true);
-        for (const [name,entries] of packed) {
-          const archive = await packArchive(nativePath(packStaging,name),nativePath(project,name),entries);
-          manifest.push({path:name,kind:'other',...archive,entries});
-        }
+        await packArchives(packed,name=>nativePath(packStaging,name),project,manifest,value=>{
+          compression = value;
+          reportProgress(true);
+        });
         await rm(packStaging,{recursive:true});
       }
       const archivedBytes = manifest.reduce((total,entry)=>total+entry.bytes,0);
       stage = 'register';
+      compression = undefined;
       reportProgress(true);
       await mkdir(path.dirname(target), {recursive:true});
       await rename(work, target);
@@ -592,7 +630,6 @@ export class Library {
         client.off('error',onDatabaseError);
         client.release(!unlocked);
       }
-      this.publishing.delete(input.id);
     }
   }
 
@@ -701,11 +738,11 @@ export class Library {
     const totalBytes = template.manifest.reduce((total,entry)=>total+entry.bytes,0);
     let bytesRead = 0;
     let stage:ArchiveProgress['stage'] = 'copy';
-    let archiveName:ArchiveName|undefined;
+    let compression:CompressionProgress|undefined;
     let lastUpdate = -Infinity;
     const report = () => {
       lastUpdate = performance.now();
-      progress({title:template.title,stage,archive:archiveName,bytesRead,totalBytes});
+      progress({title:template.title,stage,compression,bytesRead,totalBytes});
     };
     const onBytes = (count:number) => {
       bytesRead += count;
@@ -729,14 +766,14 @@ export class Library {
           createWriteStream(destination,{flags:'wx'}));
       }
       stage = 'pack';
-      for (const [name,entries] of archives) {
-        archiveName = name;
+      const copiedBytes = bytesRead;
+      await packArchives(archives,()=>source,project,manifest,value=>{
+        compression = value;
+        bytesRead = copiedBytes+value.bytesRead;
         report();
-        const archive = await packArchive(source,nativePath(project,name),entries,onBytes);
-        manifest.push({path:name,kind:'other',...archive,entries});
-      }
+      });
       stage = 'register';
-      archiveName = undefined;
+      compression = undefined;
       report();
       const knownSequences = new Set(template.sequences.map(sequence=>sequence.path));
       const detected = sequencesFor([...archives.values()].flat())

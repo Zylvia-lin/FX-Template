@@ -131,6 +131,14 @@ export interface ArchiveProgress {
   totalBytes: number;
   elapsedMs: number;
   currentFile?: {path: string; bytesCopied: number; totalBytes: number};
+  compression?: CompressionProgress;
+}
+
+export interface CompressionProgress {
+  archive: ArchiveName;
+  bytesRead: number;
+  totalBytes: number;
+  complete: boolean;
 }
 
 export interface PackProgress {
@@ -142,7 +150,7 @@ export interface PackProgress {
   current?: {
     title:string;
     stage:ArchiveProgress['stage'];
-    archive?:ArchiveName;
+    compression?:CompressionProgress;
     bytesRead:number;
     totalBytes:number;
   };
