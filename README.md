@@ -37,6 +37,8 @@ npm.cmd run dev
 
 ## FX Agent 只读查询
 
+首次接入时，打开 [FX Agent 仓库](https://github.com/Zylvia-lin/fx-agent)，按仓库 README 的「快速开始 → 安装与连接」完成安装并连接 Codex。本节的联动查询需要 FX Agent 提供 `fx_search_published_templates` 工具。
+
 启动更新后的桌面端，连接素材库后保持运行，可以最小化到托盘。重新连接 FX Agent 后，使用 `fx_search_published_templates` 按模板名称或标签搜索已发布模板。每次最多返回 25 条，有后续结果时会提供 `nextOffset`。原有的 `fx_search_templates` 继续查询 FX Agent 的模板研究库。
 
 FX Agent 在搜索前检查本机接口和数据库连通性。本机无可用模板库时，工具以 `available: false` 标记该来源，并略过搜索。若使用自定义 `VFX_USER_DATA`，桌面端和 FX Agent 进程需要使用同一配置目录。
