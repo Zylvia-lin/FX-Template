@@ -6,7 +6,7 @@ import { Transform, type PassThrough } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import Fastify, { LogController } from 'fastify';
 import { ZipFile } from 'yazl';
-import type { ArchiveProgress, PublishInput, Settings } from '../contracts';
+import type { DesktopProgress, PublishInput, Settings } from '../contracts';
 import { openLibrary, type Library } from './library';
 import { Backups } from './backup';
 
@@ -26,7 +26,7 @@ export function createServer(options: {
   token:string; logPath:string; catalogToken?:string;
   loadSettings:()=>Promise<Settings | undefined>;
   saveSettings:(s:Settings)=>Promise<void>;
-  progress:(event:ArchiveProgress)=>void;
+  progress:(event:DesktopProgress)=>void;
 }) {
   const app = Fastify({
     logger:{file:options.logPath,redact:['req.headers.authorization','password','*.password']},
@@ -137,10 +137,28 @@ export function createServer(options: {
     try { return await active().scan(request.body.paths,request.body.previousPlanId); }
     finally { importing--; }
   });
-  app.post<{Body:PublishInput}>('/publish',{schema:{body:allRequired({
-    id:uuid,title:shortString,tags,preview:shortStringWithPath(),
-    paths:{type:'array',minItems:1,maxItems:200000,items:shortStringWithPath()},
-  })}},async request => {
+  app.get('/tools/compress-storage',async()=>active().packCandidates());
+  app.post<{Body:{ids:string[]}}>('/tools/compress-storage',{
+    schema:{body:allRequired({ids:{type:'array',minItems:1,uniqueItems:true,items:uuid}})},
+  },async request=>{
+    const current = active();
+    if (configuring || importing) throw new Error('请等待库维护或模板入库完成');
+    configuring = migrating = true;
+    backups?.stop();
+    try {
+      await backups?.waitForCurrent();
+      return await current.packExisting(request.body.ids,options.progress);
+    } finally {
+      configuring = migrating = false;
+      backups?.start();
+    }
+  });
+  app.post<{Body:PublishInput}>('/publish',{schema:{body:{
+    type:'object',required:['id','title','tags','preview','paths'],additionalProperties:false,
+    properties:{id:uuid,title:shortString,tags,preview:shortStringWithPath(),
+      paths:{type:'array',minItems:1,maxItems:200000,items:shortStringWithPath()},
+      archives:{type:'array',uniqueItems:true,items:{...shortStringWithPath(),pattern:'\\.zip$'}}},
+  }}},async request => {
     if (migrating) throw new Error('素材库正在迁移，请稍后再入库');
     if (!request.body.title.trim()) throw new Error('请输入模板名称');
     importing++;

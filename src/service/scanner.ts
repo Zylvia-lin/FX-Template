@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { lstat, readdir, realpath } from 'node:fs/promises';
 import path from 'node:path';
-import type { FileKind, ImportRow, Plan, Sequence, SourceFile } from '../contracts';
+import type { ArchiveName, FileKind, ImportRow, Plan, Sequence, SourceFile } from '../contracts';
 
 export const nativePath = (root: string, relative: string) => {
   if (!relative || relative.split('/').some(part =>
@@ -26,12 +26,12 @@ export function classify(relative: string): Pick<SourceFile, 'kind' | 'keep' | '
   if (/\.(hda|hdalc|hdanc|otl)$/.test(lower)) return {kind: 'hda', keep: true, reason: 'Houdini 资产库'};
   if (ext === '.mov') return {kind: 'movie', keep: true, reason: 'MOV 预览候选'};
   if (/\.(hdr|rat|tx|tex)$/.test(lower)) return {kind: 'texture', keep: true, reason: '贴图或 HDRI 候选'};
-  if (/\.(exr|png|jpg|jpeg|tiff?|tga|dpx|webp)$/.test(lower)) {
+  const image = /\.(exr|png|jpg|jpeg|tiff?|tga|dpx|webp)$/.test(lower);
+  if (image || /\.(dds|psd|bmp|gif)$/.test(lower)) {
     const imageFolder = parts.slice(0,-1).reverse().map(part=>destinations.get(part))
       .find(folder=>folder==='render'||folder==='tex'||folder==='hdr');
-    return imageFolder==='tex'||imageFolder==='hdr'
-      ? {kind: 'texture', keep: true, reason: '贴图或 HDRI 候选'}
-      : {kind: 'image', keep: true, reason: '图像或渲染帧'};
+    if (imageFolder==='tex'||imageFolder==='hdr') return {kind: 'texture', keep: true, reason: '贴图或 HDRI 候选'};
+    if (image) return {kind: 'image', keep: true, reason: '图像或渲染帧'};
   }
   if (lower.endsWith('~') || ['thumbs.db', 'desktop.ini', '.ds_store'].includes(parts.at(-1)!) ||
       ['.log', '.tmp', '.bak'].includes(ext)) return {kind: 'other', keep: false, reason: '临时文件或编辑器备份'};
@@ -88,10 +88,10 @@ function framePattern(filename: string) {
   return {pattern:filename.slice(0,-name.length)+`${prefix}%0${digits.length}d${suffix}`,frame:Number(digits)};
 }
 
-function sequenceGroups<T extends {path:string;kind:FileKind}>(files: T[]) {
+function sequenceGroups<T extends {path:string;kind:FileKind}>(files: T[], kind:FileKind='image') {
   const groups = new Map<string, {files:T[];frames:Set<number>}>();
   for (const file of files) {
-    if (file.kind !== 'image') continue;
+    if (file.kind !== kind) continue;
     const frame = framePattern(file.path);
     if (!frame) continue;
     let group = groups.get(frame.pattern);
@@ -110,12 +110,43 @@ function sequenceGroups<T extends {path:string;kind:FileKind}>(files: T[]) {
       first = Math.min(first, frame);
       last = Math.max(last, frame);
     }
-    return [{files,summary:{path,first,last,count:frames.size,missing:last-first+1-frames.size}}];
+    return [{files,frames,summary:{path,first,last,count:frames.size,missing:last-first+1-frames.size}}];
   });
 }
 
+function textureSequenceGroups<T extends {path:string;kind:FileKind}>(files:T[]) {
+  const textures = new Map<string,number>();
+  for (const file of files) {
+    if (file.kind!=='texture') continue;
+    const directory = path.posix.dirname(file.path);
+    textures.set(directory,(textures.get(directory)??0)+1);
+  }
+  return sequenceGroups(files,'texture').filter(({summary,files:members,frames})=>{
+    const directory = path.posix.dirname(summary.path);
+    if (members.length!==textures.get(directory) || summary.count<5 || /(?:^|[._-])udim(?:[._-]|$)/iu.test(path.posix.basename(summary.path))) return false;
+    const numbers = [...frames].sort((a,b)=>a-b);
+    let consecutive = 1;
+    return numbers.some((frame,index)=>{
+      consecutive = index>0 && frame===numbers[index-1]+1 ? consecutive+1 : 1;
+      return consecutive>=5;
+    });
+  });
+}
+
+export function textureSequenceArchives<T extends {path:string;kind:FileKind}>(files:T[]) {
+  return new Map<ArchiveName,T[]>(textureSequenceGroups(files).flatMap(({summary,files:frames})=>{
+    const directory = path.posix.dirname(summary.path);
+    return directory==='.' ? [] : [[`${directory}.zip`,frames] as const];
+  }));
+}
+
 export function sequencesFor(files: Array<{path: string; kind: FileKind}>): Sequence[] {
-  return sequenceGroups(files).map(group=>group.summary);
+  return [...sequenceGroups(files),...textureSequenceGroups(files)].map(group=>group.summary);
+}
+
+export function renderSequencePaths(files: Array<{path: string; kind: FileKind}>) {
+  return new Set(sequenceGroups(files.filter(file=>file.path.startsWith('render/')))
+    .flatMap(group=>group.files.map(file=>file.path)));
 }
 
 function importRows(files: SourceFile[]) {
@@ -123,16 +154,17 @@ function importRows(files: SourceFile[]) {
   for (const file of files) {
     const geo = file.kind==='cache' ? geoDirectory(file.path) : undefined;
     const numbered = (file.kind==='image'||file.kind==='cache') && framePattern(file.path);
-    const directory = file.customDirectory ?? geo ?? (numbered ? path.posix.dirname(file.path) : undefined);
+    const sequenceTexture = file.kind==='texture' && file.archiveZip;
+    const directory = file.customDirectory ?? geo ?? (numbered || sequenceTexture ? path.posix.dirname(file.path) : undefined);
     if (directory) {
       const key = (file.customDirectory?'custom:':'directory:')+directory;
-      const label = directory+'/';
+      const label = directory==='.' && sequenceTexture ? path.basename(path.dirname(file.sourcePath))+'/' : directory+'/';
       const nested = geo && !file.customDirectory
         ? file.path.split('/').length - geo.split('/').length
         : 1;
       const archiveLabel = file.customDirectory ? label : (file.archivePath.split('/').slice(0,-nested).join('/')||'.')+'/';
       const reason = file.customDirectory ? '自定义目录 · 原样归档'
-        : geo ? 'geo 缓存 · 默认排除' : '序列目录';
+        : geo ? 'geo 缓存 · 默认排除' : sequenceTexture ? '序列贴图' : '序列目录';
       let row = rows.get(key);
       if (!row) {
         row = {label,archiveLabel,bytes:0,paths:[],reason};
@@ -187,7 +219,9 @@ export async function scanSources(inputs: string[], restrictedRoot: string, prev
     const prefix = singleRoot?'':rootLabel(root)+'/';
     const location = path.basename(root);
     const categoryRoot = destinations.has(location.toLowerCase())||backup.has(location.toLowerCase())||location.toLowerCase()==='add_file';
-    const rulePath = (categoryRoot ? location+'/' : prefix)+relative;
+    const rootParts = root.split(path.sep);
+    const textureRoot = rootParts.findLastIndex(part=>destinations.get(part.toLowerCase())==='tex');
+    const rulePath = (categoryRoot ? location+'/' : textureRoot>=0 ? rootParts.slice(textureRoot).join('/')+'/' : prefix)+relative;
     scanned.push({path:prefix+relative,sourcePath,prefix,rulePath,bytes:stat.size,modified:stat.mtimeMs,...classify(rulePath)});
   }
   async function visit(root:string,directory:string,prefix:string):Promise<void> {
@@ -205,12 +239,17 @@ export async function scanSources(inputs: string[], restrictedRoot: string, prev
   }
   const selectedFiles = new Set(sources.filter(source=>!source.directory).map(source=>source.file));
   const frames = new Set(sequenceGroups(scanned).flatMap(group=>group.files.map(file=>file.path)));
+  const textureFrames = new Set(textureSequenceGroups(scanned).flatMap(group=>group.files.map(file=>file.path)));
   const files: SourceFile[] = scanned.map(({rulePath,prefix,...file})=>{
-    const {archivePath,customDirectory} = archiveLocation(rulePath,file.kind,frames.has(file.path));
+    const renderFrame = frames.has(file.path);
+    const {archivePath,customDirectory} = archiveLocation(rulePath,file.kind,renderFrame);
+    const archiveZip:ArchiveName|undefined = /\.abc$/iu.test(file.path) ? 'abc.zip'
+      : renderFrame && !customDirectory ? 'render.zip'
+      : textureFrames.has(file.path) && !customDirectory ? `${path.posix.dirname(archivePath)}.zip` : undefined;
     const explicitlyChosen = selectedFiles.has(file.sourcePath)&&(file.keep||file.reason==='用途待确认');
-    if (!customDirectory) return {...file,archivePath,keep:file.keep||explicitlyChosen};
+    if (!customDirectory) return {...file,archivePath,archiveZip,keep:file.keep||explicitlyChosen};
     const displayDirectory = prefix+customDirectory.split('/').slice(prefix?1:0).join('/');
-    return {...file,archivePath,customDirectory:displayDirectory.replace(/\/$/,''),keep:explicitlyChosen,reason:'自定义目录，可勾选原样归档'};
+    return {...file,archivePath,archiveZip,customDirectory:displayDirectory.replace(/\/$/,''),keep:explicitlyChosen,reason:'自定义目录，可勾选原样归档'};
   });
   files.sort((a, b) => a.path.localeCompare(b.path, 'zh-CN', {numeric: true}));
   const movies = files.filter(file => file.kind === 'movie' && (file.keep || selectedFiles.has(file.sourcePath)));

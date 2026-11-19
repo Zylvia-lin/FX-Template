@@ -32,6 +32,10 @@ p{line-height:1.6}
 header{min-height:72px;display:flex;justify-content:space-between;align-items:center;gap:16px;border-bottom:1px solid var(--line);padding:12px 25px;background:#191c1e}
 .title{font-weight:720;font-size:20px;white-space:nowrap}
 .toolbar,.field-row,.filter{display:flex;gap:8px;align-items:center}
+.archive-options{flex-wrap:wrap}
+.archive-options label{display:flex;align-items:center;min-width:0}
+.archive-options input{flex:none}
+.archive-options span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .field-row input{flex:1;min-width:0}
 .search{width:clamp(150px,26vw,300px)}
 .banner,.busy{margin:12px 24px 0;padding:10px 14px;border-radius:8px;background:#293529;color:#e0efcd;overflow-wrap:anywhere}
@@ -78,6 +82,8 @@ label{display:grid;gap:6px}
 label input:not([type=checkbox]),label select{width:100%;min-width:0}
 .path{overflow-wrap:anywhere;margin-bottom:12px}
 .file-list{border:1px solid var(--line);border-radius:9px;overflow:hidden;margin-bottom:10px}
+.toolbox .file-list{margin-top:12px}
+.toolbox .pack-row{grid-template-columns:25px minmax(0,1fr)}
 .file-row{display:grid;grid-template-columns:25px minmax(0,1fr) minmax(115px,190px) 86px;align-items:center;padding:6px 10px;min-height:40px;gap:8px;background:var(--side)}
 .file-row:nth-child(even){background:var(--surface)}
 .file-row span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}

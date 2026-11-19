@@ -157,6 +157,15 @@ async function start() {
   });
   handle('list',(input:Parameters<DesktopApi['list']>[0]) => json('/library','POST',input));
   handle('detail',(id:string) => json(`/templates/${encodeURIComponent(id)}`));
+  handle('pack-candidates',() => json('/tools/compress-storage'));
+  handle('pack-existing',async (ids:string[])=>{
+    const response = await service.app.inject({
+      method:'POST',url:'/tools/compress-storage',headers:{authorization:`Bearer ${token}`},payload:{ids},
+    });
+    const result = response.json();
+    if (response.statusCode>=400) throw new Error(result.message ?? '压缩存储库失败');
+    return result;
+  });
   handle('tags',(id:string,tags:string[]) => json(`/templates/${encodeURIComponent(id)}/tags`,'PUT',{tags}));
   handle('description',(id:string,description:string) => json(`/templates/${encodeURIComponent(id)}/description`,'PUT',{description}));
   handle('trash',(id:string) => json(`/templates/${encodeURIComponent(id)}`,'DELETE'));

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import type { ArchiveProgress, CatalogFilters, DesktopApi, Plan, Settings, Template, TemplateDetail } from '../contracts';
+import { archiveNames, archiveSizes } from '../contracts';
+import type { ArchiveName, ArchiveProgress, CatalogFilters, DesktopApi, DesktopProgress, PackCandidate, PackExistingResult, PackProgress, Plan, Settings, Template, TemplateDetail } from '../contracts';
 import './style.css';
 
 declare global { interface Window {vfx: DesktopApi;} }
@@ -62,7 +63,7 @@ function useBanner() {
 
 function App() {
   const [status,setStatus] = useState<Awaited<ReturnType<DesktopApi['status']>>>();
-  const [panel,setPanel] = useState<'library'|'settings'|'trash'>('library');
+  const [panel,setPanel] = useState<'library'|'settings'|'trash'|'toolbox'>('library');
   const [items,setItems] = useState<Template[]>([]);
   const [trashPage,setTrashPage] = useState(0);
   const [trashHasNext,setTrashHasNext] = useState(false);
@@ -81,7 +82,7 @@ function App() {
   const [notice,setNotice] = useBanner();
   const [revision,setRevision] = useState(0);
   const [dragging,setDragging] = useState(false);
-  const [progress,setProgress] = useState<ArchiveProgress>();
+  const [progress,setProgress] = useState<DesktopProgress>();
   const changeCardZoom = useCallback((step:number)=>{
     setCardZoom(previous=>Math.min(maxCardZoom,Math.max(0,previous+step)));
   },[]);
@@ -137,9 +138,9 @@ function App() {
     return ()=>{obsolete=true;clearTimeout(timeout);};
   },[search,activeTags,mode,trashOpen,trashPage,status?.configured,revision]);
 
-  async function action(label:string, callback:()=>Promise<void>) {
+  async function action<T>(label:string, callback:()=>Promise<T>) {
     setBusy(label);setError('');setNotice('');
-    try {await callback();}
+    try {return await callback();}
     catch (err) {setError(errorText(err));}
     finally {setBusy('');setProgress(undefined);}
   }
@@ -198,13 +199,15 @@ function App() {
     setItems([]);setTrashHasNext(false);setTrashLoading(true);setTrashPage(page);
   };
   const settingsOpen = Boolean(status && (!status.configured || panel==='settings'));
+  const toolboxOpen = panel==='toolbox' && Boolean(status?.configured);
+  const libraryOpen = !settingsOpen&&!trashOpen&&!toolboxOpen;
   return <div className="shell" onDragOver={event=>{
-    if (status?.configured && !settingsOpen && !trashOpen && !busy && event.dataTransfer.types.includes('Files')) {
+    if (status?.configured && libraryOpen && !busy && event.dataTransfer.types.includes('Files')) {
       event.preventDefault();setDragging(true);
     }
   }} onDrop={event=>{
     event.preventDefault();setDragging(false);
-    if(status?.configured&&!settingsOpen&&!trashOpen&&!busy) {
+    if(status?.configured&&libraryOpen&&!busy) {
       const paths = api.pathsForDrop(Array.from(event.dataTransfer.files));
       void importPaths(async()=>paths,Boolean(plan));
     }
@@ -212,12 +215,14 @@ function App() {
     <aside className="rail">
       <div className="brand"><span className="brand-mark">✦</span><strong>特效模板库</strong></div>
       <div className="rail-label">工作区</div>
-      <button className={settingsOpen||trashOpen?'nav':'nav current'} onClick={()=>{if(trashOpen)setItems([]);setPanel('library');setPlan(undefined);}} disabled={Boolean(busy)||!status?.configured}>▦ <span>全部模板</span></button>
+      <button className={libraryOpen?'nav current':'nav'} onClick={()=>{if(trashOpen)setItems([]);setPanel('library');setPlan(undefined);}} disabled={Boolean(busy)||!status?.configured}>▦ <span>全部模板</span></button>
       <button className={trashOpen?'nav current':'nav'} onClick={()=>{
         if(!trashOpen)openTrashPage(0);
         setPanel('trash');setPlan(undefined);setSelected(undefined);
       }} disabled={Boolean(busy)||!status?.configured}>⌫ <span>回收站</span></button>
       <button className={settingsOpen?'nav current':'nav'} onClick={()=>{setPanel('settings');setPlan(undefined);}} disabled={Boolean(busy)||!status}>⚙ <span>库设置</span></button>
+      <button className={toolboxOpen?'nav current':'nav'} onClick={()=>{setPanel('toolbox');setPlan(undefined);}}
+        disabled={Boolean(busy)||!status?.configured}>▣ <span>工具箱</span></button>
       <div className="rail-label tag-heading">标签</div>
       {available.map(tag=><button className={`nav tag ${activeTags.includes(tag)?'chosen':''}`} key={tag} onClick={()=>{
         if(trashOpen)setItems([]);
@@ -229,8 +234,8 @@ function App() {
       <div className="connection"><span className={status?.configured?'online':''}/>{status?.configured?'本地库已连接':'本地库未连接'}</div>
     </aside>
     <main className="main">
-      <header><div className="title">{settingsOpen?'库设置':plan?'导入预检':trashOpen?'回收站':'全部模板'}</div>
-        {!settingsOpen&&!trashOpen&&!plan&&status?.configured&&<div className="toolbar">
+      <header><div className="title">{settingsOpen?'库设置':toolboxOpen?'工具箱':plan?'导入预检':trashOpen?'回收站':'全部模板'}</div>
+        {libraryOpen&&!plan&&status?.configured&&<div className="toolbar">
           <input className="search" type="search" aria-label="搜索模板名称或标签" placeholder="搜索模板名称或标签" maxLength={100} value={search} onChange={event=>setSearch(event.target.value)}/>
           <button disabled={Boolean(busy)} onClick={()=>void importPaths(()=>api.pickSource())}>选择文件</button>
           <button className="primary" disabled={Boolean(busy)} onClick={()=>void folders()}>＋ 导入目录</button>
@@ -238,17 +243,24 @@ function App() {
       </header>
       {error&&<div role="alert" className="banner error">{error}<button onClick={()=>setError('')} aria-label="关闭错误">×</button></div>}
       {notice&&<div role="status" className="banner">{notice}<button onClick={()=>setNotice('')} aria-label="关闭提示">×</button></div>}
-      {busy&&(progress && plan?.id===progress.id
-        ? <ArchiveStatus progress={progress}/>
-        : <div className="busy" role="status">{busy}</div>)}
+      {busy&&(progress && 'type' in progress && toolboxOpen
+        ? <PackStatus progress={progress}/>
+        : progress && 'id' in progress && plan?.id===progress.id
+          ? <ArchiveStatus progress={progress}/>
+          : <div className="busy" role="status">{busy}</div>)}
       {settingsOpen&&<SettingsView key={String(status?.configured)} initial={{...defaults,...status?.settings}} warning={status?.warning}
         working={Boolean(busy)} connected={Boolean(status?.configured)} save={save} backup={backup}
         migrate={migrateStorage} restoreDatabase={restoreDatabase}/>}
-      {!settingsOpen&&plan&&<ImportView plan={plan} working={Boolean(busy)} close={()=>setPlan(undefined)}
+      {toolboxOpen&&<Toolbox working={Boolean(busy)} pack={ids=>action('正在压缩所选模板，请保持应用运行',async()=>{
+        const result = await api.packExisting(ids);
+        setSelected(undefined);setRevision(value=>value+1);
+        return result;
+      })}/>}
+      {libraryOpen&&plan&&<ImportView plan={plan} working={Boolean(busy)} close={()=>setPlan(undefined)}
         addFolders={()=>void importPaths(()=>api.pickDirectories(),true)}
         addFiles={()=>void importPaths(()=>api.pickSource(),true)}
-        publish={(title,tags,preview,paths)=>void action('正在归档模板',async()=>{
-        const template=await api.publish({id:plan.id,title,tags,preview,paths});
+        publish={(title,tags,preview,paths,archives)=>void action('正在归档模板',async()=>{
+        const template=await api.publish({id:plan.id,title,tags,preview,paths,archives});
         setPlan(undefined);setSearch('');setRevision(value=>value+1);
         setSelected(await api.detail(template.id));
         setNotice('模板已入库');
@@ -264,7 +276,7 @@ function App() {
           <button disabled={Boolean(busy)} onClick={()=>void restore(item.id)}>恢复</button>
         </div>)}
       </section>}
-      {!settingsOpen&&!trashOpen&&!plan&&status?.configured&&<div className="body">
+      {libraryOpen&&!plan&&status?.configured&&<div className="body">
         <section className="catalog">
           <div className="library-head"><span>{items.length} 个模板</span>
             {activeTags.length>0&&<div className="filter">
@@ -398,7 +410,7 @@ function ArchiveStatus({progress}: {progress:ArchiveProgress}) {
   const amount = (value:number) => value ? bytes(value) : '0 B';
   return <section className="busy archive-progress" aria-label="归档进度">
     <div className="archive-progress-heading">
-      <strong>{stage==='copy'?'正在复制并校验文件':'正在登记模板'}</strong>
+      <strong>{stage==='copy'?'正在复制并校验文件':stage==='pack'?'正在压缩素材':'正在登记模板'}</strong>
       <span>{stage==='copy'?`${percent}%`:'文件已复制'}</span>
     </div>
     <progress aria-label="文件复制进度" value={percent} max={100}/>
@@ -406,6 +418,27 @@ function ArchiveStatus({progress}: {progress:ArchiveProgress}) {
       {stage==='copy' && elapsedMs>=1000 && bytesCopied>0 && ` · 平均 ${bytes(bytesCopied*1000/elapsedMs)}/s`}
     </p>
     {currentFile&&<p className="archive-current" title={currentFile.path}>正在处理 {currentFile.path} · {amount(currentFile.bytesCopied)} / {amount(currentFile.totalBytes)}</p>}
+  </section>;
+}
+
+function PackStatus({progress}: {progress:PackProgress}) {
+  const {total,packed,skipped,failed,current} = progress;
+  const done = packed+skipped+failed;
+  const percent = current?.totalBytes ? Math.min(100,Math.floor(100*current.bytesRead/current.totalBytes)) : 0;
+  return <section className="busy archive-progress" aria-label="存储库压缩进度">
+    <div className="archive-progress-heading">
+      <strong>正在压缩所选模板</strong>
+      <span>已处理 {done} / {total} 个模板</span>
+    </div>
+    {current&&<>
+      <p className="archive-current" title={current.title}>{current.title} · {
+        current.stage==='copy' ? '正在复制并校验散文件'
+          : current.stage==='pack' ? `正在压缩 ${current.archive}` : '正在登记新版本'
+      }</p>
+      <progress aria-label="当前模板素材处理进度" value={percent} max={100}/>
+      <p>已读取 {current.bytesRead ? bytes(current.bytesRead) : '0 B'} / {current.totalBytes ? bytes(current.totalBytes) : '0 B'} · {percent}%</p>
+    </>}
+    {(skipped>0||failed>0)&&<p>已压缩 {packed} 个 · 跳过 {skipped} 个 · 失败 {failed} 个</p>}
   </section>;
 }
 
@@ -477,9 +510,75 @@ function SettingsView({initial,working,connected,warning,save,backup,migrate,res
   </form>;
 }
 
+function Toolbox({working,pack}:{
+  working:boolean;pack:(ids:string[])=>Promise<PackExistingResult|undefined>;
+}) {
+  const [candidates,setCandidates] = useState<PackCandidate[]>();
+  const [selected,setSelected] = useState(new Set<string>());
+  const [scanning,setScanning] = useState(false);
+  const [error,setError] = useState('');
+  const [result,setResult] = useState<PackExistingResult>();
+  const selection = candidates?.filter(template=>selected.has(template.id))??[];
+  const size = (templates:PackCandidate[])=>templates.reduce((total,template)=>
+    total+template.archives.reduce((sum,archive)=>sum+archive.bytes,0),0);
+  async function scan() {
+    setScanning(true);setError('');
+    try {
+      setCandidates(await api.packCandidates());
+      setSelected(new Set());
+    } catch (err) {
+      setError(errorText(err));
+    } finally {setScanning(false);}
+  }
+  return <section className="content toolbox">
+    <div className="toolbar">
+      <button type="button" disabled={working||scanning} onClick={()=>{setResult(undefined);void scan();}}>压缩所有存储库</button>
+      {scanning&&<span role="status">正在扫描模板…</span>}
+    </div>
+    {error&&<p role="alert" className="warning">{error}</p>}
+    {result&&<section aria-live="polite">
+      <p>已压缩 {result.packed} 个模板 · 已跳过 {result.skipped} 个 · 失败 {result.failed.length} 个</p>
+      {result.failed.map(item=><p key={item.id} className="warning">{item.title} · {item.message}</p>)}
+    </section>}
+    {candidates&&<section>
+      <p>待处理 {candidates.length} 个模板 · 素材总大小 {bytes(size(candidates))}</p>
+      {candidates.length>0&&<>
+        <p className="muted">压缩后保留原版本。使用压缩素材前，请将 ZIP 解压到工程目录。</p>
+        <div className="toolbar">
+          <button type="button" disabled={working||scanning} onClick={()=>setSelected(
+            selected.size===candidates.length ? new Set() : new Set(candidates.map(template=>template.id))
+          )}>{selected.size===candidates.length?'取消全选':'全选'}</button>
+          <button type="button" className="primary" disabled={working||scanning||!selection.length} onClick={()=>void (async()=>{
+            const next = await pack(selection.map(template=>template.id));
+            if (next) {setResult(next);await scan();}
+          })()}>开始压缩</button>
+          <span>已选 {selection.length} 个 · {bytes(size(selection))}</span>
+        </div>
+        <div className="file-list">
+          {candidates.map(template=><label className="file-row pack-row" key={template.id}>
+            <input type="checkbox" checked={selected.has(template.id)} disabled={working||scanning} onChange={event=>{
+              const checked = event.target.checked;
+              setSelected(previous=>{
+                const next = new Set(previous);
+                if (checked) next.add(template.id);
+                else next.delete(template.id);
+                return next;
+              });
+            }}/>
+            <span className="file-location">
+              <span title={template.title}>{template.title}{template.trashed?'（回收站）':''}</span>
+              <small>{template.archives.map(archive=>`${archive.name} · ${archive.files} 个文件 · ${bytes(archive.bytes)}`).join(' / ')}</small>
+            </span>
+          </label>)}
+        </div>
+      </>}
+    </section>}
+  </section>;
+}
+
 function ImportView({plan,working,close,addFolders,addFiles,publish}:{
   plan:Plan;working:boolean;close:()=>void;addFolders:()=>void;addFiles:()=>void;
-  publish:(title:string,tags:string[],preview:string,paths:string[])=>void;
+  publish:(title:string,tags:string[],preview:string,paths:string[],archives:ArchiveName[])=>void;
 }) {
   const previousPlan = useRef(plan);
   const [title,setTitle] = useState(plan.title);
@@ -487,6 +586,7 @@ function ImportView({plan,working,close,addFolders,addFiles,publish}:{
   const [tagDraft,setTagDraft] = useState('');
   const [preview,setPreview] = useState(plan.preview??'');
   const [selected,setSelected] = useState(new Set(plan.files.filter(file=>file.keep).map(file=>file.path)));
+  const [archiveChoices,setArchiveChoices] = useState<Partial<Record<ArchiveName,boolean>>>({});
   const [filter,setFilter] = useState('');
   const [page,setPage] = useState(0);
   useEffect(()=>{
@@ -508,12 +608,15 @@ function ImportView({plan,working,close,addFolders,addFiles,publish}:{
   const visible = search ? plan.rows.filter(row=>row.label.toLowerCase().includes(search) ||
     row.archiveLabel.toLowerCase().includes(search) || row.paths.some(file=>file.toLowerCase().includes(search))) : plan.rows;
   const chosen = plan.files.filter(file=>selected.has(file.path));
+  const sizes = archiveSizes(chosen);
+  const availableArchives = [...new Set<ArchiveName>([...archiveNames,...sizes.keys()])].filter(name=>sizes.has(name));
+  const archives = availableArchives.filter(name=>archiveChoices[name] ?? true);
   return <form className="import" onSubmit={event=>{
     event.preventDefault();
     if (working || !selected.has(preview)) return;
     const next = mergeTags(tags,tagDraft);
     setTags(next);setTagDraft('');
-    publish(title,next,preview,[...selected]);
+    publish(title,next,preview,[...selected],archives);
   }}>
     <div className="content import-scroll">
       <div className="import-sources">
@@ -538,6 +641,14 @@ function ImportView({plan,working,close,addFolders,addFiles,publish}:{
       </div>
       <div className="library-head"><span>保留 {selected.size} / {plan.files.length} 个文件 · {bytes(chosen.reduce((sum,file)=>sum+file.bytes,0))} · {plan.sequences.length} 组候选序列</span>
         <input type="search" placeholder="筛选相对路径" aria-label="筛选相对路径" value={filter} onChange={e=>{setFilter(e.target.value);setPage(0);}}/></div>
+      {availableArchives.length>0&&<div className="toolbar archive-options">
+        {availableArchives.map(name=><label key={name}>
+          <input type="checkbox" checked={archives.includes(name)} disabled={working} onChange={event=>{
+            const checked = event.target.checked;
+            setArchiveChoices(previous=>({...previous,[name]:checked}));
+          }}/><span title={name}>压缩为 {name}（{bytes(sizes.get(name)??0)}）</span>
+        </label>)}
+      </div>}
       <div className="file-list">
         {visible.slice(page*100,page*100+100).map(row=>{
           const all = row.paths.every(file=>selected.has(file));
@@ -566,7 +677,7 @@ function ImportView({plan,working,close,addFolders,addFiles,publish}:{
         <span>{page+1} / {Math.ceil(visible.length/100)}</span><button type="button" disabled={(page+1)*100>=visible.length} onClick={()=>setPage(page+1)}>下一页</button></div>}
     </div>
     <footer className="import-actions">
-      <p className="muted">按整组序列或自定义目录勾选。{chosen.some(file=>file.archivePath!==file.path)&&'整理后的路径有变化，请在 Houdini 或 Nuke 检查并重连相关引用。'}</p>
+      <p className="muted">按整组序列或自定义目录勾选。{archives.length>0&&`素材将打包为 ${archives.join('、')}，使用前解压到工程目录。`}{chosen.some(file=>file.archivePath!==file.path)&&'整理后的路径有变化，请在 Houdini 或 Nuke 检查并重连相关引用。'}</p>
       <div className="toolbar"><button type="button" disabled={working} onClick={close}>取消</button><button type="submit" className="primary" disabled={working||!selected.has(preview)}>发布模板</button></div>
     </footer>
   </form>;
@@ -584,6 +695,7 @@ function Detail({item,working,close,setTags,setDescription,exportPackage,moveToT
   const [savingDescription,setSavingDescription] = useState(false);
   const [mediaError,setMediaError] = useState(false);
   const [confirmTrash,setConfirmTrash] = useState(false);
+  const archives = item.manifest.filter(file=>file.entries?.length).map(file=>file.path);
 
   async function updateTags(tags:string[],submitted?:boolean) {
     if (tags.length===item.tags.length) {
@@ -625,6 +737,7 @@ function Detail({item,working,close,setTags,setDescription,exportPackage,moveToT
       <button disabled={working} onClick={()=>exportPackage('slim')}>导出精简包</button>
       <button className="primary" disabled={working} onClick={()=>exportPackage('full')}>导出完整模板</button>
     </div>
+    {archives.length>0&&<p className="muted">使用素材前，请将 {archives.join('、')} 解压到工程目录。</p>}
     <dl className="detail-meta">
       <div><dt>发布时间</dt><dd><time dateTime={item.publishedAt}>{publicationTime.format(new Date(item.publishedAt))}</time></dd></div>
       <div><dt>文件数量</dt><dd>{item.files} 个</dd></div>

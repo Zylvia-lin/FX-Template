@@ -1,15 +1,26 @@
 export type FileKind = 'houdini' | 'nuke' | 'cache' | 'image' | 'texture' | 'hda' | 'movie' | 'other';
+export const archiveNames = ['render.zip','abc.zip'] as const;
+export type ArchiveName = `${string}.zip`;
 
 export interface SourceFile {
   path: string;
   sourcePath: string;
   archivePath: string;
   customDirectory?: string;
+  archiveZip?: ArchiveName;
   bytes: number;
   modified: number;
   kind: FileKind;
   keep: boolean;
   reason: string;
+}
+
+export function archiveSizes(files: SourceFile[]) {
+  const sizes = new Map<ArchiveName,number>();
+  for (const {archiveZip,bytes} of files) {
+    if (archiveZip) sizes.set(archiveZip,(sizes.get(archiveZip)??0)+bytes);
+  }
+  return sizes;
 }
 
 export interface Sequence {
@@ -63,9 +74,17 @@ export interface Template {
   publishedAt: string;
 }
 
+interface ArchivedFile {
+  path: string;
+  sourcePath?: string;
+  bytes: number;
+  sha256: string;
+  kind: FileKind;
+}
+
 export interface TemplateDetail extends Template {
   description: string;
-  manifest: Array<{path: string; sourcePath?: string; bytes: number; sha256: string; kind: FileKind}>;
+  manifest: Array<ArchivedFile & {entries?: ArchivedFile[]}>;
   sequences: Sequence[];
 }
 
@@ -75,6 +94,7 @@ export interface PublishInput {
   tags: string[];
   preview: string;
   paths: string[];
+  archives?: ArchiveName[];
 }
 
 export interface BackupResult {
@@ -89,9 +109,22 @@ export interface RestoreResult {
   unavailable: number;
 }
 
+export interface PackExistingResult {
+  packed: number;
+  skipped: number;
+  failed: Array<{id:string;title:string;message:string}>;
+}
+
+export interface PackCandidate {
+  id:string;
+  title:string;
+  trashed:boolean;
+  archives:Array<{name:ArchiveName;files:number;bytes:number}>;
+}
+
 export interface ArchiveProgress {
   id: string;
-  stage: 'copy' | 'register';
+  stage: 'copy' | 'pack' | 'register';
   completed: number;
   total: number;
   bytesCopied: number;
@@ -99,6 +132,23 @@ export interface ArchiveProgress {
   elapsedMs: number;
   currentFile?: {path: string; bytesCopied: number; totalBytes: number};
 }
+
+export interface PackProgress {
+  type: 'pack-existing';
+  total:number;
+  packed:number;
+  skipped:number;
+  failed:number;
+  current?: {
+    title:string;
+    stage:ArchiveProgress['stage'];
+    archive?:ArchiveName;
+    bytesRead:number;
+    totalBytes:number;
+  };
+}
+
+export type DesktopProgress = ArchiveProgress | PackProgress;
 
 export interface CatalogFilters {
   mode: 'all' | 'any';
@@ -111,6 +161,8 @@ export interface DesktopApi {
   saveCatalogFilters(filters: CatalogFilters): Promise<void>;
   configure(settings: Settings): Promise<void>;
   migrateStorage(root: string): Promise<void>;
+  packCandidates(): Promise<PackCandidate[]>;
+  packExisting(ids:string[]): Promise<PackExistingResult>;
   pickDirectory(): Promise<string | undefined>;
   pickDirectories(): Promise<string[]>;
   pickSource(): Promise<string[]>;
@@ -127,6 +179,6 @@ export interface DesktopApi {
   export(id: string, mode: 'slim' | 'full'): Promise<string | undefined>;
   openTemplateDirectory(id: string): Promise<void>;
   openLogs(): Promise<void>;
-  onProgress(listener: (event: ArchiveProgress) => void): () => void;
+  onProgress(listener: (event: DesktopProgress) => void): () => void;
   pathsForDrop(files: File[]): string[];
 }

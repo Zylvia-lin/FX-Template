@@ -2,12 +2,15 @@ import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
 import { cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, rmdir, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { Transform } from 'node:stream';
+import { Transform, type PassThrough } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
+import { constants as zlib } from 'node:zlib';
 import pg from 'pg';
+import { ZipFile } from 'yazl';
 import type { FastifyBaseLogger } from 'fastify';
-import type { ArchiveProgress, Plan, PublishInput, Settings, Template, TemplateDetail } from '../contracts';
-import { nativePath, scanSources, sequencesFor } from './scanner';
+import type { ArchiveName, ArchiveProgress, PackCandidate, PackExistingResult, PackProgress, Plan, PublishInput, Settings, Template, TemplateDetail } from '../contracts';
+import { archiveNames } from '../contracts';
+import { nativePath, renderSequencePaths, scanSources, sequencesFor, textureSequenceArchives } from './scanner';
 import { restoreDatabaseBackup } from './restore';
 
 const schema = `
@@ -155,6 +158,72 @@ const selectSummary = `
 
 const importVersion = /^\.import-([a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})\.json$/u;
 const lockKey = 'hashtextextended($1,0)';
+
+type LegacyArchive = Pick<TemplateDetail,'id'|'version'|'title'|'manifest'|'sequences'> & {trashed:boolean};
+
+function legacyArchives(manifest:TemplateDetail['manifest']) {
+  const renderPaths = renderSequencePaths(manifest);
+  const occupied = new Set<string>();
+  for (const entry of manifest) {
+    for (let name=entry.path.toLowerCase();name!=='.'&&name!=='/';name=path.posix.dirname(name)) occupied.add(name);
+  }
+  const archives = new Map<ArchiveName,TemplateDetail['manifest']>(archiveNames.flatMap(name=>{
+    const entries = manifest.filter(entry=>name==='render.zip' ? renderPaths.has(entry.path) : /\.abc$/iu.test(entry.path));
+    return entries.length ? [[name,entries] as const] : [];
+  }));
+  for (const [name,entries] of textureSequenceArchives(manifest)) archives.set(name,entries);
+  for (const name of archives.keys()) {
+    if (occupied.has(name.toLowerCase())) archives.delete(name);
+  }
+  return archives;
+}
+
+function verifyStream(entry:TemplateDetail['manifest'][number], onBytes?:(count:number)=>void) {
+  const hash = createHash('sha256');
+  let bytes = 0;
+  return new Transform({
+    transform(chunk,_encoding,callback) {
+      hash.update(chunk);
+      bytes += chunk.length;
+      onBytes?.(chunk.length);
+      callback(null,chunk);
+    },
+    flush(callback) {
+      callback(bytes===entry.bytes && hash.digest('hex')===entry.sha256 ? undefined
+        : new Error(`素材校验失败：${entry.path}`));
+    },
+  });
+}
+
+async function packArchive(directory:string, destination:string, entries:TemplateDetail['manifest'], onBytes?:(count:number)=>void) {
+  await mkdir(path.dirname(destination),{recursive:true});
+  const archive = new ZipFile();
+  const output = archive.outputStream as PassThrough;
+  archive.on('error',error=>output.destroy(error));
+  const hash = createHash('sha256');
+  let bytes = 0;
+  const checksum = new Transform({transform(chunk,_encoding,callback) {
+    hash.update(chunk);
+    bytes += chunk.length;
+    callback(null,chunk);
+  }});
+  const abort = new AbortController();
+  for (const entry of entries) {
+    const source = nativePath(directory,entry.path);
+    archive.addReadStreamLazy(entry.path,{size:entry.bytes,compressionLevel:zlib.Z_BEST_COMPRESSION},callback=>{
+      const verified = verifyStream(entry,onBytes);
+      callback(null,verified);
+      void pipeline(createReadStream(source),verified,{signal:abort.signal}).catch(error=>{
+        if (!abort.signal.aborted) output.destroy(error);
+      });
+    });
+  }
+  const writing = pipeline(output,checksum,createWriteStream(destination,{flags:'wx'}));
+  archive.end({forceZip64Format:true,comment:''});
+  try { await writing; }
+  finally { abort.abort(); }
+  return {bytes,sha256:hash.digest('hex')};
+}
 
 function containsDirectory(parent:string, child:string) {
   const relative = path.relative(parent,child);
@@ -309,6 +378,24 @@ export class Library {
     const preview = files.find(item => item.kind === 'movie' && item.path === input.preview);
     if (!preview) throw new Error('请选择要归档的主预览 MOV');
     const destinations = new Map<string,string>();
+    const packed = new Map<ArchiveName,TemplateDetail['manifest']>();
+    const enabled = input.archives && new Set(input.archives);
+    const textureSources = new Map<ArchiveName,string>();
+    for (const {archiveZip,kind,sourcePath} of files) {
+      if (!archiveZip || enabled && !enabled.has(archiveZip)) continue;
+      if (kind==='texture') {
+        const directory = path.dirname(sourcePath);
+        const previous = textureSources.get(archiveZip);
+        if (previous && previous!==directory) throw new Error(`不同贴图目录将生成同名压缩包：${archiveZip}`);
+        textureSources.set(archiveZip,directory);
+      }
+      if (!packed.has(archiveZip)) {
+        const key = archiveZip.toLowerCase();
+        if (destinations.has(key)) throw new Error(`压缩包归档路径重复：${archiveZip}`);
+        packed.set(archiveZip,[]);
+        destinations.set(key,`自动生成的 ${archiveZip}`);
+      }
+    }
     for (const file of files) {
       const key = file.archivePath.toLowerCase();
       const conflict = destinations.get(key);
@@ -317,6 +404,11 @@ export class Library {
         throw new Error(`「${conflict}」和「${file.path}」的归档路径相同，请取消勾选其中一项或调整源文件名。`);
       }
       destinations.set(key,file.path);
+    }
+    for (const name of packed.keys()) {
+      for (let directory=path.posix.dirname(name);directory!=='.';directory=path.posix.dirname(directory)) {
+        if (destinations.has(directory.toLowerCase())) throw new Error(`压缩包归档目录与文件重名：${directory}`);
+      }
     }
     for (const file of files) {
       for (let directory=path.posix.dirname(file.archivePath);directory!=='.';directory=path.posix.dirname(directory)) {
@@ -330,6 +422,8 @@ export class Library {
     const templateId = randomUUID();
     const version = randomUUID();
     const work = path.join(this.root, 'staging', version);
+    const project = path.join(work,'project');
+    const packStaging = path.join(work,'pack-input');
     const intent = path.join(this.root,'staging',`.import-${version}.json`);
     const target = path.join(this.root, 'templates', templateId, version);
     const manifest: TemplateDetail['manifest'] = [];
@@ -338,6 +432,7 @@ export class Library {
     let stage: ArchiveProgress['stage'] = 'copy';
     let currentFile: ArchiveProgress['currentFile'];
     let bytesCopied = 0;
+    let completed = 0;
     let lastUpdate = -Infinity;
     let moved = false;
     let intentWritten = false;
@@ -348,7 +443,7 @@ export class Library {
       const now = performance.now();
       if (!force && now-lastUpdate < 200) return;
       lastUpdate = now;
-      progress({id:input.id,stage,completed:manifest.length,total:files.length,bytesCopied,totalBytes,
+      progress({id:input.id,stage,completed,total:files.length,bytesCopied,totalBytes,
         elapsedMs:Math.round(now-started),currentFile:currentFile && {...currentFile}});
     };
     logger.info({files:files.length,totalBytes,relocatedFiles:files.filter(file=>file.path!==file.archivePath).length},'import.publish_started');
@@ -365,7 +460,9 @@ export class Library {
         currentFile = current;
         reportProgress();
         const source = file.sourcePath;
-        const destination = nativePath(path.join(work,'project'),file.archivePath);
+        const archiveName = file.archiveZip;
+        const archive = archiveName && packed.get(archiveName);
+        const destination = nativePath(archive ? nativePath(packStaging,archiveName) : project,file.archivePath);
         const resolved = await realpath(source);
         if (path.relative(source, resolved) !== '') throw new Error('源路径已改动，请重新扫描');
         const before = await lstat(source);
@@ -384,12 +481,26 @@ export class Library {
         await pipeline(createReadStream(source), hashStream, createWriteStream(destination, {flags:'wx'}));
         const after = await lstat(source);
         if (after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs || bytes !== before.size) throw new Error('复制过程中源文件发生变化');
-        manifest.push({path:file.archivePath,...(file.archivePath!==file.path ? {sourcePath:file.path} : {}),bytes,kind:file.kind,sha256:hash.digest('hex')});
-        if (manifest.length % 100 === 0 || manifest.length === files.length) {
-          logger.info({completed:manifest.length,total:files.length,bytesCopied,totalBytes}, 'import.copy_progress');
+        const entries = archive || manifest;
+        entries.push({path:file.archivePath,...(file.archivePath!==file.path ? {sourcePath:file.path} : {}),bytes,kind:file.kind,sha256:hash.digest('hex')});
+        completed++;
+        if (completed % 100 === 0 || completed === files.length) {
+          logger.info({completed,total:files.length,bytesCopied,totalBytes}, 'import.copy_progress');
         }
       }
       currentFile = undefined;
+      const sequences = sequencesFor(files.filter(file=>file.kind!=='texture' || file.archiveZip)
+        .map(file=>({path:file.archivePath,kind:file.kind})));
+      if (packed.size) {
+        stage = 'pack';
+        reportProgress(true);
+        for (const [name,entries] of packed) {
+          const archive = await packArchive(nativePath(packStaging,name),nativePath(project,name),entries);
+          manifest.push({path:name,kind:'other',...archive,entries});
+        }
+        await rm(packStaging,{recursive:true});
+      }
+      const archivedBytes = manifest.reduce((total,entry)=>total+entry.bytes,0);
       stage = 'register';
       reportProgress(true);
       await mkdir(path.dirname(target), {recursive:true});
@@ -397,10 +508,10 @@ export class Library {
       moved = true;
       await client.query('BEGIN');
       await client.query('INSERT INTO vfx_templates(id,version,title,preview,manifest,sequences,bytes,files) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
-        [templateId,version,input.title.trim(),preview.archivePath,JSON.stringify(manifest),JSON.stringify(sequencesFor(manifest)),bytesCopied,files.length]);
+        [templateId,version,input.title.trim(),preview.archivePath,JSON.stringify(manifest),JSON.stringify(sequences),archivedBytes,manifest.length]);
       await setTags(client, templateId, input.tags);
       const {rows:[summary]} = await client.query<Template>(`${selectSummary} FROM vfx_templates t WHERE t.id=$1`,[templateId]);
-      result = {...summary,bytes:bytesCopied};
+      result = {...summary,bytes:archivedBytes};
       await client.query('COMMIT');
       this.plans.delete(input.id);
       await rm(intent,{force:true}).catch(error=>logger.warn(errorFields(error),'import.intent_cleanup_failed'));
@@ -487,6 +598,130 @@ export class Library {
     const {rows} = await this.pool.query(`${selectSummary},t.description,t.manifest,t.sequences FROM vfx_templates t WHERE t.id=$1 AND t.deleted_at IS NULL`, [id]);
     if (!rows[0]) throw new Error('未找到模板');
     return {...rows[0],bytes:Number(rows[0].bytes)};
+  }
+
+  private async legacyTemplates(ids?:string[]) {
+    const {rows} = await this.pool.query<LegacyArchive>(`SELECT id,version,title,manifest,sequences,
+      deleted_at IS NOT NULL AS trashed FROM vfx_templates
+      WHERE ($1::uuid[] IS NULL OR id=ANY($1::uuid[])) ORDER BY created_at DESC,id`,[ids??null]);
+    return rows;
+  }
+
+  async packCandidates(): Promise<PackCandidate[]> {
+    return (await this.legacyTemplates()).flatMap(({id,title,trashed,manifest})=>{
+      const archives = Array.from(legacyArchives(manifest),([name,entries])=>({
+        name,files:entries.length,bytes:entries.reduce((total,entry)=>total+entry.bytes,0),
+      }));
+      return archives.length ? [{id,title,trashed,archives}] : [];
+    });
+  }
+
+  async packExisting(ids:string[], progress:(event:PackProgress)=>void): Promise<PackExistingResult> {
+    progress({type:'pack-existing',total:ids.length,packed:0,skipped:0,failed:0});
+    const templates = await this.legacyTemplates(ids);
+    const result:PackExistingResult = {packed:0,skipped:ids.length-templates.length,failed:[]};
+    const report = (current?:PackProgress['current'])=>progress({
+      type:'pack-existing',total:ids.length,packed:result.packed,skipped:result.skipped,failed:result.failed.length,current,
+    });
+    for (const template of templates) {
+      const archives = legacyArchives(template.manifest);
+      if (!archives.size) {result.skipped++;report();continue;}
+      try {
+        await this.packLegacyTemplate(template,archives,report);
+        result.packed++;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.log.warn({templateId:template.id,...errorFields(error)},'archive.repack_failed');
+        result.failed.push({id:template.id,title:template.title,message});
+      }
+      report();
+    }
+    if (!templates.length) report();
+    return result;
+  }
+
+  private async packLegacyTemplate(template:LegacyArchive, archives:ReturnType<typeof legacyArchives>,
+    progress:(current:NonNullable<PackProgress['current']>)=>void) {
+    const {id,version:previousVersion} = template;
+    const version = randomUUID();
+    const intent = path.join(this.root,'staging',`.import-${version}.json`);
+    const staging = path.join(this.root,'staging',version);
+    const project = path.join(staging,'project');
+    const source = this.projectDirectory(template);
+    const target = path.join(this.root,'templates',id,version);
+    const included = new Set(Array.from(archives.values()).flatMap(entries=>entries.map(entry=>entry.path)));
+    const manifest = template.manifest.filter(entry=>!included.has(entry.path));
+    const totalBytes = template.manifest.reduce((total,entry)=>total+entry.bytes,0);
+    let bytesRead = 0;
+    let stage:ArchiveProgress['stage'] = 'copy';
+    let archiveName:ArchiveName|undefined;
+    let lastUpdate = -Infinity;
+    const report = () => {
+      lastUpdate = performance.now();
+      progress({title:template.title,stage,archive:archiveName,bytesRead,totalBytes});
+    };
+    const onBytes = (count:number) => {
+      bytesRead += count;
+      if (performance.now()-lastUpdate>=300) report();
+    };
+    report();
+    let client:pg.PoolClient|undefined = await this.pool.connect();
+    let moved = false;
+    let intentWritten = false;
+    const connectionLost = (error:Error)=>this.log.warn({templateId:id,...errorFields(error)},'archive.database_connection_lost');
+    client.on('error',connectionLost);
+    try {
+      await client.query(`SELECT pg_advisory_lock(${lockKey})`,[version]);
+      await writeFile(intent,JSON.stringify({templateId:id,taskId:version}),{flag:'wx',flush:true});
+      intentWritten = true;
+      await mkdir(project,{recursive:true});
+      for (const entry of manifest) {
+        const destination = nativePath(project,entry.path);
+        await mkdir(path.dirname(destination),{recursive:true});
+        await pipeline(createReadStream(nativePath(source,entry.path)),verifyStream(entry,onBytes),
+          createWriteStream(destination,{flags:'wx'}));
+      }
+      stage = 'pack';
+      for (const [name,entries] of archives) {
+        archiveName = name;
+        report();
+        const archive = await packArchive(source,nativePath(project,name),entries,onBytes);
+        manifest.push({path:name,kind:'other',...archive,entries});
+      }
+      stage = 'register';
+      archiveName = undefined;
+      report();
+      const knownSequences = new Set(template.sequences.map(sequence=>sequence.path));
+      const detected = sequencesFor([...archives.values()].flat())
+        .filter(sequence=>!knownSequences.has(sequence.path));
+      await writeFile(path.join(staging,'.pack-origin.json'),JSON.stringify({
+        version:previousVersion,manifest:template.manifest,sequences:template.sequences,
+      }),{flag:'wx',flush:true});
+      await rename(staging,target);
+      moved = true;
+      const updated = await client.query(`UPDATE vfx_templates SET version=$3,manifest=$4,bytes=$5,files=$6,sequences=$7
+        WHERE id=$1 AND version=$2`,[id,previousVersion,version,JSON.stringify(manifest),
+        manifest.reduce((total,file)=>total+file.bytes,0),manifest.length,JSON.stringify([...template.sequences,...detected])]);
+      if (!updated.rowCount) throw new Error('模板版本已变化，请重新扫描');
+      await rm(intent,{force:true}).catch(error=>this.log.warn(errorFields(error),'archive.repack_intent_cleanup_failed'));
+      this.log.info({templateId:id,previousVersion,version},'archive.repacked');
+    } catch (error) {
+      client?.off('error',connectionLost);
+      client?.release(true);
+      client = undefined;
+      if (moved) {
+        if (await this.reconcileImport(version,intent,true)) return;
+      } else if (intentWritten) {
+        try {
+          await rm(staging,{recursive:true,force:true});
+          await rm(intent,{force:true});
+        } catch (cleanup) { this.log.warn(errorFields(cleanup),'archive.repack_cleanup_failed'); }
+      }
+      throw error;
+    } finally {
+      client?.off('error',connectionLost);
+      client?.release(true);
+    }
   }
 
   async updateTags(id: string, names: string[]) {

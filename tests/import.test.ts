@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
+import { createHash, randomUUID } from 'node:crypto';
 import { cp, mkdir, mkdtemp, readFile, readdir, realpath, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
@@ -7,18 +8,23 @@ import { test } from 'node:test';
 import pg from 'pg';
 import { scanSources, nativePath } from '../src/service/scanner';
 import { createServer } from '../src/service/server';
-import type { ArchiveProgress, Plan, Settings, Template, TemplateDetail } from '../src/contracts';
+import type { ArchiveProgress, PackProgress, Plan, Settings, Template, TemplateDetail } from '../src/contracts';
 
 async function fixture() {
   const base = await mkdtemp(path.join(tmpdir(),'vfx-test-'));
   const source = path.join(base,'样本 project');
-  for (const name of ['abc','backup','render','tex','hda','houdini/render/trail','houdini/geo','houdini/review','hdr','add_file/sub']) {
+  for (const name of ['abc','backup','render','tex','tex/Dan/DPCD','tex/mixed','tex/few','tex/tiles','hda','houdini/render/trail','houdini/geo','houdini/review','hdr','add_file/sub']) {
     await mkdir(path.join(source,name),{recursive:true});
   }
   for (const name of [
     'shot_efx_v01.hip','shot_efx_v01.nk','shot_efx_v01.nk~','shot_efx_ck_v001.mov','shot_ANI_ck.mov',
     'abc/fx.abc','abc/model.fbx','backup/old.hip','render/fx.1001.exr','render/fx.1003.exr',
     'tex/map.1001.exr','tex/map.1002.exr','hda/template.hda',
+    'tex/mixed/albedo.dds','tex/few/label.0001.png','tex/few/label.0002.png','tex/few/label.0003.png',
+    ...Array.from({length:5},(_,index)=>{
+      const frame = String(index+1).padStart(4,'0');
+      return [`tex/Dan/DPCD/DiPinCD.${frame}.png`,`tex/mixed/dust.${frame}.png`,`tex/tiles/coat_udim.${1001+index}.exr`];
+    }).flat(),
     'houdini/render/trail/trail.0000.exr','houdini/render/trail/trail.0100.exr',
     'houdini/render/trail/extras.0010.exr','houdini/render/trail/extras.0020.exr',
     'houdini/geo/sim.bgeo.sc','houdini/review/reference.mov','hdr/sky.hdr',
@@ -34,6 +40,20 @@ test('按项目组织混合素材，选择预览并区分 UDIM 与帧序列',asy
   assert.equal(plan.preview,'shot_efx_ck_v001.mov');
   assert.deepEqual(plan.sequences.find(sequence=>sequence.path==='render/fx.%04d.exr'),
     {path:'render/fx.%04d.exr',first:1001,last:1003,count:2,missing:1});
+  assert.equal(plan.files.find(file=>file.path==='render/fx.1001.exr')?.archiveZip,'render.zip');
+  assert.equal(plan.files.find(file=>file.path==='abc/fx.abc')?.archiveZip,'abc.zip');
+  assert.equal(plan.files.find(file=>file.path==='tex/map.1001.exr')?.archiveZip,undefined);
+  for (const file of plan.files.filter(file=>/^tex\/(?:mixed|few|tiles)\//u.test(file.path))) {
+    assert.equal(file.kind,'texture');
+    assert.equal(file.archiveZip,undefined,file.path);
+  }
+  const textureZip = 'tex/Dan/DPCD.zip';
+  assert.equal(plan.files.filter(file=>file.archiveZip===textureZip).length,5);
+  assert.deepEqual(plan.sequences.find(sequence=>sequence.path==='tex/Dan/DPCD/DiPinCD.%04d.png'),
+    {path:'tex/Dan/DPCD/DiPinCD.%04d.png',first:1,last:5,count:5,missing:0});
+  assert.equal(plan.rows.find(row=>row.label==='tex/Dan/DPCD/')?.reason,'序列贴图');
+  const textureOnly = await scanSources([path.join(source,'tex','Dan','DPCD')],root);
+  assert.ok(textureOnly.files.every(file=>file.kind==='texture'&&file.archiveZip===textureZip));
   const trail = plan.rows.filter(row=>row.label.startsWith('houdini/render/trail/'));
   assert.equal(trail.length,1);
   assert.equal(trail[0].label,'houdini/render/trail/');
@@ -243,9 +263,11 @@ test('PostgreSQL 导入、同名隔离、标签、范围预览、打包与数据
   const token = 'test-token';
   let stored:Settings|undefined;
   const progress:ArchiveProgress[] = [];
+  const packProgress:PackProgress[] = [];
   const logPath = path.join(base,'operations.jsonl');
   const catalogToken = 'catalog-test';
-  const service = server = createServer({token,logPath,catalogToken,loadSettings:async()=>stored,saveSettings:async s=>{stored=s;},progress:event=>progress.push(event)});
+  const service = server = createServer({token,logPath,catalogToken,loadSettings:async()=>stored,saveSettings:async s=>{stored=s;},
+    progress:event=>{if ('type' in event) packProgress.push(event); else progress.push(event);}});
   await service.initialize();
   const request = (method:'GET'|'POST'|'PUT'|'DELETE',url:string,payload?:object,headers?:object) =>
     service.app.inject({method,url,payload,headers:{authorization:`Bearer ${token}`,...headers}});
@@ -289,13 +311,15 @@ test('PostgreSQL 导入、同名隔离、标签、范围预览、打包与数据
     assert.equal(scanned.statusCode,200,scanned.body);
     const plan = scanned.json();
     const paths = plan.files.filter((file:{keep:boolean;path:string})=>file.keep||file.path.startsWith('add_file/')||file.path==='houdini/geo/sim.bgeo.sc').map((file:{path:string})=>file.path);
-    const result = await request('POST','/publish',{id:plan.id,title:'同名',tags,preview:plan.preview,paths});
+    const result = await request('POST','/publish',{id:plan.id,title:'同名',tags,preview:plan.preview,paths,
+      archives:ids.length ? [] : ['render.zip','abc.zip','tex/Dan/DPCD.zip']});
     assert.equal(result.statusCode,200,result.body);
     const updates = progress.filter(event=>event.id===plan.id);
     assert.equal(updates[0].stage,'copy');
     assert.ok(updates[0].currentFile?.path);
     const last = updates.at(-1)!;
     assert.equal(last.stage,'register');
+    assert.equal(updates.some(update=>update.stage==='pack'),ids.length===0);
     assert.equal(last.completed,paths.length);
     assert.equal(last.bytesCopied,last.totalBytes);
     if (!ids.length) publishedVersion = result.json().version;
@@ -324,15 +348,47 @@ test('PostgreSQL 导入、同名隔离、标签、范围预览、打包与数据
   const directory = await request('GET',`/templates/${ids[0]}/directory`);
   assert.equal(directory.statusCode,200,directory.body);
   assert.equal(directory.json().directory,await realpath(project));
-  assert.equal(await readFile(path.join(project,'render/trail/trail.0000.exr'),'utf8'),'fixture houdini/render/trail/trail.0000.exr');
+  const renderZip = path.join(project,'render.zip');
+  await assert.rejects(readFile(path.join(project,'render/trail/trail.0000.exr')),{code:'ENOENT'});
+  const renderPaths = execFileSync('tar',['-tf',renderZip],{encoding:'utf8'}).trim().split(/\r?\n/u);
+  assert.deepEqual(renderPaths.sort(),[
+    'render/fx.1001.exr','render/fx.1003.exr',
+    'render/trail/extras.0010.exr','render/trail/extras.0020.exr',
+    'render/trail/trail.0000.exr','render/trail/trail.0100.exr',
+  ]);
   assert.equal(await readFile(path.join(project,'geo/sim.bgeo.sc'),'utf8'),'fixture houdini/geo/sim.bgeo.sc');
   await assert.rejects(readFile(path.join(project,'geo/sim.0001.bgeo.sc')),{code:'ENOENT'});
-  assert.equal(await readFile(path.join(project,'add_file/sub/reference.abc'),'utf8'),'fixture add_file/sub/reference.abc');
+  await assert.rejects(readFile(path.join(project,'add_file/sub/reference.abc')),{code:'ENOENT'});
+  assert.equal(await readFile(path.join(project,'abc/model.fbx'),'utf8'),'fixture abc/model.fbx');
   assert.equal(await readFile(path.join(project,'hdr/sky.hdr'),'utf8'),'fixture hdr/sky.hdr');
   await assert.rejects(readFile(path.join(project,'houdini/render/trail/trail.0000.exr')), {code:'ENOENT'});
-  const detail = (await request('GET',`/templates/${ids[0]}`)).json();
+  const detail = (await request('GET',`/templates/${ids[0]}`)).json<TemplateDetail>();
   assert.equal(new Date(detail.publishedAt).toISOString(),detail.publishedAt);
-  assert.ok(detail.manifest.some((file:{path:string;sourcePath?:string})=>file.path==='render/trail/trail.0000.exr'&&file.sourcePath==='houdini/render/trail/trail.0000.exr'));
+  const archive = detail.manifest.find(file=>file.path==='render.zip')!;
+  assert.equal(detail.files,detail.manifest.length);
+  assert.equal(detail.bytes,detail.manifest.reduce((total,file)=>total+file.bytes,0));
+  assert.equal(archive.sha256,createHash('sha256').update(await readFile(renderZip)).digest('hex'));
+  assert.equal(archive.entries?.length,renderPaths.length);
+  for (const entry of archive.entries!) {
+    const data = execFileSync('tar',['-xOf',renderZip,entry.path]);
+    assert.deepEqual(data,await readFile(path.join(source,entry.sourcePath??entry.path)));
+    assert.equal(entry.sha256,createHash('sha256').update(data).digest('hex'));
+  }
+  const abcZip = path.join(project,'abc.zip');
+  assert.deepEqual(execFileSync('tar',['-tf',abcZip],{encoding:'utf8'}).trim().split(/\r?\n/u).sort(),
+    ['abc/fx.abc','add_file/sub/reference.abc']);
+  assert.equal(execFileSync('tar',['-xOf',abcZip,'add_file/sub/reference.abc'],{encoding:'utf8'}),
+    'fixture add_file/sub/reference.abc');
+  const textureZip = 'tex/Dan/DPCD.zip';
+  const textureFrame = 'tex/Dan/DPCD/DiPinCD.0001.png';
+  const textureArchive = detail.manifest.find(entry=>entry.path===textureZip);
+  assert.equal(textureArchive?.entries?.length,5);
+  assert.deepEqual(execFileSync('tar',['-xOf',path.join(project,textureZip),textureFrame]),
+    await readFile(path.join(source,textureFrame)));
+  await assert.rejects(readFile(path.join(project,textureFrame)),{code:'ENOENT'});
+  assert.equal(await readFile(path.join(project,'tex/mixed/albedo.dds'),'utf8'),'fixture tex/mixed/albedo.dds');
+  assert.equal(await readFile(path.join(project,'tex/mixed/dust.0001.png'),'utf8'),'fixture tex/mixed/dust.0001.png');
+  assert.equal(await readFile(path.join(project,'tex/few/label.0001.png'),'utf8'),'fixture tex/few/label.0001.png');
   assert.ok(detail.sequences.some((sequence:{path:string})=>sequence.path==='render/trail/trail.%04d.exr'));
   const list = await request('POST','/library',{search:'同名',tags:['写实','烟尘'],mode:'all'});
   assert.equal(list.statusCode,200,list.body);
@@ -350,12 +406,44 @@ test('PostgreSQL 导入、同名隔离、标签、范围预览、打包与数据
   assert.equal(slim.statusCode,200,slim.body.slice(0,100));
   assert.equal(slim.rawPayload.subarray(0,2).toString(),'PK');
   assert.ok(slim.rawPayload.includes(Buffer.from('project/shot_efx_v01.hip')));
-  assert.ok(!slim.rawPayload.includes(Buffer.from('project/render/fx.1001.exr')));
+  assert.ok(!slim.rawPayload.includes(Buffer.from('project/render.zip')));
+  assert.ok(!slim.rawPayload.includes(Buffer.from('project/abc.zip')));
   const full = await request('GET',`/templates/${ids[0]}/package?mode=full`);
   assert.equal(full.statusCode,200);
-  assert.ok(full.rawPayload.includes(Buffer.from('project/render/fx.1001.exr')));
-  assert.ok(full.rawPayload.includes(Buffer.from('project/render/trail/trail.0000.exr')));
-  assert.ok(full.rawPayload.includes(Buffer.from('project/add_file/sub/reference.abc')));
+  assert.ok(full.rawPayload.includes(Buffer.from('project/render.zip')));
+  assert.ok(!full.rawPayload.includes(Buffer.from('project/render/fx.1001.exr')));
+  assert.ok(full.rawPayload.includes(Buffer.from('project/abc.zip')));
+  assert.ok(full.rawPayload.includes(Buffer.from('project/'+textureZip)));
+  const legacy = (await request('GET',`/templates/${ids[1]}`)).json<TemplateDetail>();
+  const legacyProject = path.join(root,'templates',legacy.id,legacy.version,'project');
+  const toolsRoute = '/tools/compress-storage';
+  const candidates = (await request('GET',toolsRoute)).json();
+  assert.deepEqual(candidates.map((item:{id:string})=>item.id),[ids[1]]);
+  assert.deepEqual(candidates[0].archives.map((item:{name:string})=>item.name),['render.zip','abc.zip',textureZip]);
+  assert.equal(await readFile(path.join(legacyProject,textureFrame),'utf8'),`fixture ${textureFrame}`);
+  const oldCache = path.join(legacyProject,'abc/external/external.abc');
+  await writeFile(oldCache,'wrong source!');
+  const invalidLegacy = (await request('POST',toolsRoute,{ids:[legacy.id]})).json();
+  assert.equal(invalidLegacy.packed,0);
+  assert.match(invalidLegacy.failed[0].message,/素材校验失败/);
+  assert.equal(packProgress.at(-1)?.failed,1);
+  assert.equal((await request('GET',`/templates/${legacy.id}`)).json().version,legacy.version);
+  await writeFile(oldCache,'separate cache');
+  packProgress.length = 0;
+  const packed = (await request('POST',toolsRoute,{ids:[legacy.id]})).json();
+  assert.deepEqual(packed,{packed:1,skipped:0,failed:[]});
+  assert.deepEqual([...new Set(packProgress.flatMap(event=>event.current?.archive?[event.current.archive]:[]))],['render.zip','abc.zip',textureZip]);
+  const registration = packProgress.find(event=>event.current?.stage==='register')?.current;
+  assert.equal(registration?.title,legacy.title);
+  assert.equal(registration?.bytesRead,legacy.bytes);
+  assert.equal(packProgress.at(-1)?.packed,1);
+  const legacyUpdated = (await request('GET',`/templates/${legacy.id}`)).json<TemplateDetail>();
+  assert.notEqual(legacyUpdated.version,legacy.version);
+  assert.deepEqual(legacyUpdated.tags,legacy.tags);
+  assert.deepEqual(legacyUpdated.sequences,legacy.sequences);
+  assert.equal(await readFile(oldCache,'utf8'),'separate cache');
+  assert.deepEqual((await request('GET',toolsRoute)).json(),[]);
+  for (const name of ['render.zip','abc.zip',textureZip]) assert.ok(legacyUpdated.manifest.some(entry=>entry.path===name));
   await writeFile(path.join(source,'houdini/geo/fx.abc'),'相同归档路径');
   const conflictingPlan = (await request('POST','/scan',{paths:[source]})).json();
   const conflict = await request('POST','/publish',{
