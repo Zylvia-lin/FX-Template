@@ -129,8 +129,8 @@ export async function restoreDatabaseBackup(pool:pg.Pool,root:string,file:string
     try {
       await client.query('BEGIN');
       const {rows:inserted} = await client.query<{id:string}>(`
-        INSERT INTO vfx_templates(id,version,title,preview,manifest,sequences,bytes,files,created_at,deleted_at)
-        SELECT id,version,title,preview,manifest,sequences,bytes,files,created_at,deleted_at
+        INSERT INTO vfx_templates(id,version,title,preview,manifest,sequences,bytes,files,created_at,deleted_at,description)
+        SELECT id,version,title,preview,manifest,sequences,bytes,files,created_at,deleted_at,COALESCE(description,'')
         FROM jsonb_populate_recordset(NULL::vfx_templates,$1::jsonb)
         ON CONFLICT (id) DO NOTHING RETURNING id
       `,[JSON.stringify(candidates)]);

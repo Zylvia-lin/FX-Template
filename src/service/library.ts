@@ -21,6 +21,7 @@ const schema = `
   );
   CREATE TABLE IF NOT EXISTS vfx_tags (key text PRIMARY KEY, name text NOT NULL);
   ALTER TABLE vfx_templates ADD COLUMN IF NOT EXISTS deleted_at timestamptz;
+  ALTER TABLE vfx_templates ADD COLUMN IF NOT EXISTS description text NOT NULL DEFAULT '';
   CREATE TABLE IF NOT EXISTS vfx_template_tags (
     template_id uuid REFERENCES vfx_templates(id) ON DELETE CASCADE,
     tag_key text REFERENCES vfx_tags(key), PRIMARY KEY (template_id, tag_key)
@@ -483,7 +484,7 @@ export class Library {
   }
 
   async detail(id: string): Promise<TemplateDetail> {
-    const {rows} = await this.pool.query(`${selectSummary},t.manifest,t.sequences FROM vfx_templates t WHERE t.id=$1 AND t.deleted_at IS NULL`, [id]);
+    const {rows} = await this.pool.query(`${selectSummary},t.description,t.manifest,t.sequences FROM vfx_templates t WHERE t.id=$1 AND t.deleted_at IS NULL`, [id]);
     if (!rows[0]) throw new Error('未找到模板');
     return {...rows[0],bytes:Number(rows[0].bytes)};
   }
@@ -501,6 +502,12 @@ export class Library {
       await client.query('ROLLBACK').catch(() => undefined);
       throw error;
     } finally { client.release(); }
+  }
+
+  async updateDescription(id: string, description: string) {
+    const result = await this.pool.query(
+      'UPDATE vfx_templates SET description=$2 WHERE id=$1 AND deleted_at IS NULL',[id,description]);
+    if (!result.rowCount) throw new Error('未找到模板');
   }
 
   async setTrashed(id: string, trashed: boolean) {

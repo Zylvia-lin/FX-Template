@@ -64,6 +64,7 @@ export interface Template {
 }
 
 export interface TemplateDetail extends Template {
+  description: string;
   manifest: Array<{path: string; sourcePath?: string; bytes: number; sha256: string; kind: FileKind}>;
   sequences: Sequence[];
 }
@@ -118,6 +119,7 @@ export interface DesktopApi {
   list(input: {search: string; tags: string[]; mode: 'all' | 'any'; trashed?: boolean; page?: number}): Promise<{items: Template[]; tags: string[]; hasNext: boolean}>;
   detail(id: string): Promise<TemplateDetail>;
   updateTags(id: string, tags: string[]): Promise<void>;
+  updateDescription(id: string, description: string): Promise<void>;
   trash(id: string): Promise<void>;
   restore(id: string): Promise<void>;
   backup(): Promise<BackupResult>;

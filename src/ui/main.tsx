@@ -24,7 +24,7 @@ function mergeTags(tags:string[],draft:string) {
 
 function TagField({tags,draft,disabled,onTags,onDraft}:{
   tags:string[];draft:string;disabled:boolean;
-  onTags:(tags:string[])=>void;onDraft:(draft:string)=>void;
+  onTags:(tags:string[],submitted?:boolean)=>void;onDraft:(draft:string)=>void;
 }) {
   const id = useId();
   const field = useRef<HTMLInputElement>(null);
@@ -38,12 +38,11 @@ function TagField({tags,draft,disabled,onTags,onDraft}:{
           field.current?.focus();
         }}>×</button>
       </span>)}
-      <input id={id} ref={field} value={draft} disabled={disabled} placeholder="输入标签后按回车" onChange={event=>onDraft(event.target.value)}
+      <input id={id} ref={field} value={draft} readOnly={disabled} placeholder="输入标签后按回车" onChange={event=>onDraft(event.target.value)}
         onKeyDown={event=>{
           if (event.key!=='Enter' || event.nativeEvent.isComposing || event.keyCode===229) return;
           event.preventDefault();
-          onTags(mergeTags(tags,draft));
-          onDraft('');
+          if (!disabled) onTags(mergeTags(tags,draft),true);
         }}/>
     </div>
   </div>;
@@ -75,6 +74,7 @@ function App() {
   const filterSnapshot = useRef<string|undefined>(undefined);
   const [search,setSearch] = useState('');
   const [selected,setSelected] = useState<TemplateDetail>();
+  const pendingMetadata = useRef<Promise<unknown>>(Promise.resolve());
   const [plan,setPlan] = useState<Plan>();
   const [busy,setBusy] = useState('');
   const [error,setError] = useBanner();
@@ -143,7 +143,23 @@ function App() {
     catch (err) {setError(errorText(err));}
     finally {setBusy('');setProgress(undefined);}
   }
-  const open = (id:string) => action('正在打开模板',async()=>setSelected(await api.detail(id)));
+  function saveMetadata(label:string, update:()=>Promise<void>) {
+    const save = pendingMetadata.current.then(async()=>{
+      try {
+        await update();
+        return true;
+      } catch (err) {
+        setError(`${label}保存失败 · ${errorText(err)}`);
+        return false;
+      }
+    });
+    pendingMetadata.current = save;
+    return save;
+  }
+  const open = (id:string) => action('正在打开模板',async()=>{
+    await pendingMetadata.current;
+    setSelected(await api.detail(id));
+  });
   const importPaths = (getPaths:()=>Promise<string[]>,append=false) => action('正在扫描项目',async()=>{
     const paths = await getPaths();
     if (!paths.length) return;
@@ -264,14 +280,22 @@ function App() {
         </section>
         {selected&&<Detail key={selected.id} item={selected} working={Boolean(busy)} close={()=>setSelected(undefined)}
           openDirectory={()=>void action('正在打开模板目录',()=>api.openTemplateDirectory(selected.id))}
-          setTags={tags=>void action('正在保存标签',async()=>{
-            await api.updateTags(selected.id,tags);setSelected(await api.detail(selected.id));setRevision(value=>value+1);setNotice('标签已保存');
+          setTags={tags=>saveMetadata('标签',async()=>{
+            await api.updateTags(selected.id,tags);
+            setRevision(value=>value+1);
+            const stored = await api.detail(selected.id);
+            setSelected(current=>current?.id===stored.id ? {...current,tags:stored.tags} : current);
+          })}
+          setDescription={description=>saveMetadata('描述',async()=>{
+            await api.updateDescription(selected.id,description);
+            setSelected(current=>current?.id===selected.id ? {...current,description} : current);
           })}
           exportPackage={mode=>void action('正在保存模板包',async()=>{
             const file=await api.export(selected.id,mode);
             if(file)setNotice(`模板包已保存 · ${file}`);
           })}
           moveToTrash={()=>void action('正在移入回收站',async()=>{
+            await pendingMetadata.current;
             await api.trash(selected.id);
             setItems(list=>list.filter(item=>item.id!==selected.id));setSelected(undefined);
             setRevision(value=>value+1);setNotice('模板已移入回收站');
@@ -504,7 +528,10 @@ function ImportView({plan,working,close,addFolders,addFiles,publish}:{
       </div>
       <div className="form-grid">
         <label>模板名称<input required maxLength={100} value={title} onChange={e=>setTitle(e.target.value)}/></label>
-        <TagField tags={tags} draft={tagDraft} disabled={working} onTags={setTags} onDraft={setTagDraft}/>
+        <TagField tags={tags} draft={tagDraft} disabled={working} onTags={(next,submitted)=>{
+          setTags(next);
+          if (submitted) setTagDraft('');
+        }} onDraft={setTagDraft}/>
         <label>主预览 MOV<select required value={preview} onChange={e=>{
           setPreview(e.target.value);setSelected(old=>new Set([...old,e.target.value]));
         }}><option value="">请选择</option>{plan.files.filter(file=>file.kind==='movie').map(file=><option key={file.path}>{file.path}</option>)}</select></label>
@@ -545,44 +572,71 @@ function ImportView({plan,working,close,addFolders,addFiles,publish}:{
   </form>;
 }
 
-function Detail({item,working,close,setTags,exportPackage,moveToTrash,openDirectory}:{
-  item:TemplateDetail;working:boolean;close:()=>void;setTags:(tags:string[])=>void;
+function Detail({item,working,close,setTags,setDescription,exportPackage,moveToTrash,openDirectory}:{
+  item:TemplateDetail;working:boolean;close:()=>void;setTags:(tags:string[])=>Promise<boolean>;
+  setDescription:(description:string)=>Promise<boolean>;
   exportPackage:(mode:'slim'|'full')=>void;moveToTrash:()=>void;openDirectory:()=>void;
 }) {
-  const [tags,setTagChips] = useState(item.tags);
+  const descriptionId = useId();
   const [tagDraft,setTagDraft] = useState('');
+  const [descriptionDraft,setDescriptionDraft] = useState(item.description);
+  const [savingTags,setSavingTags] = useState(false);
+  const [savingDescription,setSavingDescription] = useState(false);
   const [mediaError,setMediaError] = useState(false);
   const [confirmTrash,setConfirmTrash] = useState(false);
+
+  async function updateTags(tags:string[],submitted?:boolean) {
+    if (tags.length===item.tags.length) {
+      if (submitted) setTagDraft('');
+      return;
+    }
+    setSavingTags(true);
+    const saved = await setTags(tags);
+    if (saved && submitted) setTagDraft('');
+    setSavingTags(false);
+  }
+
+  async function updateDescription() {
+    if (savingDescription || descriptionDraft===item.description) return;
+    setSavingDescription(true);
+    await setDescription(descriptionDraft);
+    setSavingDescription(false);
+  }
+
   return <aside className="detail">
     <div className="detail-head"><h2>{item.title}</h2><button onClick={close} aria-label="关闭模板详情">×</button></div>
     <TemplateVideo id={item.id} controls onError={()=>setMediaError(true)}/>
     {mediaError&&<p className="warning">当前桌面播放器无法预览此 MOV，可通过模板包打开原文件。</p>}
+    <div className="detail-fields">
+      <TagField tags={item.tags} draft={tagDraft} disabled={working||savingTags}
+        onTags={(tags,submitted)=>void updateTags(tags,submitted)} onDraft={setTagDraft}/>
+      <label className="description-field" htmlFor={descriptionId}>描述
+        <textarea id={descriptionId} rows={4} value={descriptionDraft} readOnly={working||savingDescription}
+          placeholder="输入描述，Shift + Enter 换行" onChange={event=>setDescriptionDraft(event.target.value)}
+          onBlur={()=>void updateDescription()} onKeyDown={event=>{
+            if (event.key!=='Enter'||event.shiftKey||event.nativeEvent.isComposing||event.keyCode===229) return;
+            event.preventDefault();
+            event.currentTarget.blur();
+          }}/>
+      </label>
+    </div>
     <div className="toolbar detail-actions">
       <button disabled={working} onClick={openDirectory}>打开模板目录</button>
       <button disabled={working} onClick={()=>exportPackage('slim')}>导出精简包</button>
       <button className="primary" disabled={working} onClick={()=>exportPackage('full')}>导出完整模板</button>
     </div>
-    <form className="tags-form" onSubmit={event=>{
-      event.preventDefault();
-      const next = mergeTags(tags,tagDraft);
-      setTagChips(next);setTagDraft('');
-      setTags(next);
-    }}>
-      <TagField tags={tags} draft={tagDraft} disabled={working} onTags={setTagChips} onDraft={setTagDraft}/>
-      <button type="submit" disabled={working}>保存</button>
-    </form>
-    {confirmTrash?<section>
+    <dl className="detail-meta">
+      <div><dt>发布时间</dt><dd><time dateTime={item.publishedAt}>{publicationTime.format(new Date(item.publishedAt))}</time></dd></div>
+      <div><dt>文件数量</dt><dd>{item.files} 个</dd></div>
+      <div><dt>总大小</dt><dd>{bytes(item.bytes)}</dd></div>
+    </dl>
+    {confirmTrash?<section className="trash-action">
       <p>将「{item.title}」移入回收站？之后可以恢复。</p>
       <div className="toolbar">
         <button disabled={working} onClick={()=>setConfirmTrash(false)}>取消</button>
         <button className="danger" disabled={working} onClick={moveToTrash}>确认移入</button>
       </div>
     </section>:<button className="danger trash-action" disabled={working} onClick={()=>setConfirmTrash(true)}>移入回收站</button>}
-    <dl className="detail-meta">
-      <div><dt>发布时间</dt><dd><time dateTime={item.publishedAt}>{publicationTime.format(new Date(item.publishedAt))}</time></dd></div>
-      <div><dt>文件数量</dt><dd>{item.files} 个</dd></div>
-      <div><dt>总大小</dt><dd>{bytes(item.bytes)}</dd></div>
-    </dl>
   </aside>;
 }
 

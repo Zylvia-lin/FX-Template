@@ -7,7 +7,7 @@ import { test } from 'node:test';
 import pg from 'pg';
 import { scanSources, nativePath } from '../src/service/scanner';
 import { createServer } from '../src/service/server';
-import type { ArchiveProgress, Plan, Settings, Template } from '../src/contracts';
+import type { ArchiveProgress, Plan, Settings, Template, TemplateDetail } from '../src/contracts';
 
 async function fixture() {
   const base = await mkdtemp(path.join(tmpdir(),'vfx-test-'));
@@ -111,6 +111,10 @@ test('两套独立数据库通过备份双向合并新 ID，缺少素材可重�
     cp(path.join(from.root,'templates',id),path.join(to.root,'templates',id),{recursive:true});
 
   const first = await publish(a,'设备 A\t归档\\样本\n第二行',['A 标签']);
+  const firstRoute = `/templates/${first.id}`;
+  assert.equal((await a.request('GET',firstRoute)).json<TemplateDetail>().description,'');
+  const description = '第一行\n第二行\t路径\\样本';
+  assert.equal((await a.request('PUT',`${firstRoute}/description`,{description})).statusCode,200);
   const recycled = await publish(a,'设备 A 回收站',['回收站标签']);
   assert.equal((await a.request('DELETE',`/templates/${recycled.id}`)).statusCode,200);
   const second = await publish(b,'设备 B 归档',['B 标签']);
@@ -128,16 +132,21 @@ test('两套独立数据库通过备份双向合并新 ID，缺少素材可重�
   assert.deepEqual(await restore(b,fromA),{imported:0,skipped:0,unavailable:2});
   await writeFile(firstPreview,original);
   assert.deepEqual(await restore(b,fromA),{imported:1,skipped:0,unavailable:1});
-  const detail = (await b.request('GET',`/templates/${first.id}`)).json<Template>();
+  const detail = (await b.request('GET',firstRoute)).json<TemplateDetail>();
   assert.equal(detail.title,first.title);
+  assert.equal(detail.description,description);
   assert.deepEqual(detail.tags,first.tags);
   assert.equal(detail.version,first.version);
   assert.equal((await b.request('GET',`/templates/${first.id}/preview`,undefined,{range:'bytes=0-6'})).body,'fixture');
 
   assert.equal((await b.request('PUT',`/templates/${first.id}/tags`,{tags:['本机标签']})).statusCode,200);
+  assert.equal((await b.request('GET',firstRoute)).json<TemplateDetail>().description,description);
+  assert.equal((await b.request('PUT',`${firstRoute}/description`,{description:''})).statusCode,200);
   await copyTemplate(a,b,recycled.id);
   assert.deepEqual(await restore(b,fromA),{imported:1,skipped:1,unavailable:0});
-  assert.deepEqual((await b.request('GET',`/templates/${first.id}`)).json<Template>().tags,['本机标签']);
+  const local = (await b.request('GET',firstRoute)).json<TemplateDetail>();
+  assert.deepEqual(local.tags,['本机标签']);
+  assert.equal(local.description,'');
   assert.deepEqual((await b.request('POST','/library',{search:'',tags:[],mode:'all',trashed:true})).json().items.map((item:Template)=>item.id),[recycled.id]);
 
   await copyTemplate(b,a,second.id);

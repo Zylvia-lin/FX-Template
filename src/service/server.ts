@@ -180,6 +180,12 @@ export function createServer(options: {
     await active().updateTags(request.params.id,request.body.tags);
     return {ok:true};
   });
+  app.put<{Params:{id:string};Body:{description:string}}>('/templates/:id/description',{
+    schema:{params:idParams,body:allRequired({description:{type:'string'}})},
+  },async request => {
+    await active().updateDescription(request.params.id,request.body.description);
+    return {ok:true};
+  });
   app.delete<{Params:{id:string}}>('/templates/:id',{schema:{params:idParams}},async request => {
     await active().setTrashed(request.params.id,true);
     return {ok:true};

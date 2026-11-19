@@ -26,6 +26,7 @@ const api: DesktopApi = {
   list: input => ipcRenderer.invoke('list',input),
   detail: id => ipcRenderer.invoke('detail',id),
   updateTags: (id,tags) => ipcRenderer.invoke('tags',id,tags),
+  updateDescription: (id,description) => ipcRenderer.invoke('description',id,description),
   trash: id => ipcRenderer.invoke('trash',id),
   restore: id => ipcRenderer.invoke('restore',id),
   backup: () => ipcRenderer.invoke('backup'),

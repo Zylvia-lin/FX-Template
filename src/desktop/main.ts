@@ -158,6 +158,7 @@ async function start() {
   handle('list',(input:Parameters<DesktopApi['list']>[0]) => json('/library','POST',input));
   handle('detail',(id:string) => json(`/templates/${encodeURIComponent(id)}`));
   handle('tags',(id:string,tags:string[]) => json(`/templates/${encodeURIComponent(id)}/tags`,'PUT',{tags}));
+  handle('description',(id:string,description:string) => json(`/templates/${encodeURIComponent(id)}/description`,'PUT',{description}));
   handle('trash',(id:string) => json(`/templates/${encodeURIComponent(id)}`,'DELETE'));
   handle('restore',(id:string) => json(`/templates/${encodeURIComponent(id)}/restore`,'POST'));
   handle('backup',() => json('/backup','POST'));
