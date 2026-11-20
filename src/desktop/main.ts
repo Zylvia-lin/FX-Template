@@ -9,6 +9,7 @@ import { pipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'node:url';
 import type { CatalogFilters, DesktopApi, PublishInput, Settings, Template } from '../contracts';
 import { createServer } from '../service/server';
+import { createWebServer } from '../service/web';
 import { createCatalogFilterStore, writeJson } from './preferences';
 
 protocol.registerSchemesAsPrivileged([{scheme:'vfx-media',privileges:{standard:true,secure:true,stream:true}}]);
@@ -53,6 +54,22 @@ async function start() {
   });
   const origin = await service.app.listen({host:'127.0.0.1',port:0});
   await service.initialize();
+  const webPassword = process.env.VFX_WEB_PASSWORD;
+  const web = webPassword ? createWebServer({
+    origin,token,password:webPassword,uiDirectory:path.join(directory,'ui'),configured:service.configured,
+  }) : undefined;
+  if (web) {
+    const host = process.env.VFX_WEB_HOST || '0.0.0.0';
+    const port = Number(process.env.VFX_WEB_PORT || '8787');
+    try {
+      if (!Number.isInteger(port)||port<1||port>65535) throw new Error('VFX_WEB_PORT 必须在 1 到 65535 之间');
+      const address = await web.listen({host,port});
+      service.app.log.info({module:'web',address},'web.started');
+    } catch (error) {
+      service.app.log.error({module:'web',err:error},'web.start_failed');
+      dialog.showErrorBox('Web 端启动失败',(error as Error).message);
+    }
+  }
   await writeJson(catalogFile,{port:Number(new URL(origin).port),token:catalogToken}).catch(error=>{
     service.app.log.warn({module:'fx-agent',errorCode:(error as NodeJS.ErrnoException).code},'catalog.connection_file_write_failed');
   });
@@ -269,6 +286,7 @@ async function start() {
     quitting = true;
     tray?.destroy();
     abort.abort();
+    void web?.close().catch(() => undefined);
     void service.app.close().catch(() => undefined);
   });
 }

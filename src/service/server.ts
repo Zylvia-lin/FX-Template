@@ -313,7 +313,7 @@ export function createServer(options: {
     await library?.close();
   });
 
-  return {app,async initialize() {
+  return {app,configured:()=>Boolean(library),async initialize() {
     try {
       settings = await options.loadSettings();
       if (settings) {

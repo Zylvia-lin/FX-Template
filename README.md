@@ -43,6 +43,21 @@ npm.cmd run dev
 
 FX Agent 在搜索前检查本机接口和数据库连通性。本机无可用模板库时，工具以 `available: false` 标记该来源，并略过搜索。若使用自定义 `VFX_USER_DATA`，桌面端和 FX Agent 进程需要使用同一配置目录。
 
+## Web 端
+
+Web 端可搜索和预览已发布模板，修改标签与描述，打开归档文件清单，并下载精简包或完整模板。桌面端负责导入、发布、回收站、库设置、工具箱和日志。
+
+完全退出托盘里的桌面端后，在 PowerShell 中设置 Web 专用密码并重新启动。使用安装版时，从同一 PowerShell 会话启动桌面程序。
+
+```powershell
+$env:VFX_WEB_PASSWORD = Read-Host '设置 Web 专用密码' -MaskInput
+npm.cmd run dev
+```
+
+访问 [本机 Web 端](http://127.0.0.1:8787)，用户名为 `vfx`。清除 `VFX_WEB_PASSWORD` 后重启即可关闭 Web 端。应用可最小化至托盘继续提供服务。
+
+启用后默认监听 `0.0.0.0:8787`。同一局域网内的设备可通过 `http://主机局域网IP:8787` 访问，需允许入站连接。可用 `VFX_WEB_HOST` 和 `VFX_WEB_PORT` 修改监听地址和端口，例如将地址设为 `127.0.0.1` 可限制为本机访问。网页登录使用 HTTP Basic 认证，在不受信任的网络中应通过 HTTPS 入口访问。
+
 ## 验证
 
 ```powershell

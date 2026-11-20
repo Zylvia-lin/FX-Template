@@ -2,11 +2,15 @@ import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { archiveNames, archiveSizes } from '../contracts';
 import type { ArchiveName, ArchiveProgress, CatalogFilters, CompressionProgress, DesktopApi, PackCandidate, PackExistingResult, PackProgress, Plan, PublishInput, Settings, SourceFile, Template, TemplateDetail } from '../contracts';
+import { webApi } from './web-api';
 import './style.css';
 
 declare global { interface Window {vfx: DesktopApi;} }
 declare const __APP_RELEASE__: {version:string;author:string;copyright:string};
 const api = window.vfx;
+const web = !api;
+const catalogApi = api ?? webApi;
+const previewUrl = (id:string) => web ? `/api/templates/${id}/preview` : `vfx-media://preview/${id}`;
 const defaults: Settings = {root:'',host:'127.0.0.1',port:5432,database:'vfx_templates_dev',user:'postgres',password:'',backupDirectory:'',backupTime:'03:00',backupRetention:14};
 const bytes = (n:number) => n >= 1073741824 ? `${(n/1073741824).toFixed(2)} GB` : n >= 1048576 ? `${(n/1048576).toFixed(1)} MB` : `${(n/1024).toFixed(1)} KB`;
 const maxCardZoom = 8;
@@ -64,7 +68,7 @@ function useBanner() {
 type PublishJob = {id:string;title:string;error?:string};
 
 function App() {
-  const [status,setStatus] = useState<Awaited<ReturnType<DesktopApi['status']>>>();
+  const [status,setStatus] = useState<Omit<Awaited<ReturnType<DesktopApi['status']>>,'logPath'>>();
   const [panel,setPanel] = useState<'library'|'settings'|'trash'|'toolbox'>('library');
   const [items,setItems] = useState<Template[]>([]);
   const [page,setPage] = useState(0);
@@ -92,16 +96,15 @@ function App() {
   },[]);
 
   useEffect(() => {
-    if (!api) { setError('请通过 Windows 桌面程序启动模板库'); return; }
-    const filters = api.loadCatalogFilters().catch(err=>{
+    const filters = catalogApi.loadCatalogFilters().catch(err=>{
       setError(errorText(err));
       return {mode:'any',tags:[]} satisfies CatalogFilters;
     });
-    Promise.all([api.status(),filters]).then(([current,saved])=>{
+    Promise.all([catalogApi.status(),filters]).then(([current,saved])=>{
       filterSnapshot.current = JSON.stringify(saved);
       setMode(saved.mode);setActiveTags(saved.tags);setStatus(current);
     }).catch(err=>setError(errorText(err)));
-    return api.onProgress(event=>{
+    return api?.onProgress(event=>{
       if ('type' in event) setPackProgress(event);
       else setArchiveProgress(event);
     });
@@ -112,7 +115,7 @@ function App() {
     const snapshot = JSON.stringify(filters);
     if (filterSnapshot.current===snapshot) return;
     filterSnapshot.current = snapshot;
-    void api.saveCatalogFilters(filters).catch(err=>{
+    void catalogApi.saveCatalogFilters(filters).catch(err=>{
       if (filterSnapshot.current===snapshot) {
         filterSnapshot.current = undefined;
         setError(errorText(err));
@@ -124,7 +127,7 @@ function App() {
     if (!status?.configured) return;
     let obsolete = false;
     setPageLoading(true);
-    const timeout = setTimeout(()=>void api.list({search:trashOpen?'':search,tags:trashOpen?[]:activeTags,mode,
+    const timeout = setTimeout(()=>void catalogApi.list({search:trashOpen?'':search,tags:trashOpen?[]:activeTags,mode,
       trashed:trashOpen,page}).then(result=>{
       if (obsolete) return;
       if (!result.items.length && page>0) {setPage(page-1);return;}
@@ -166,7 +169,7 @@ function App() {
   }
   const open = (id:string) => action('正在打开模板',async()=>{
     await pendingMetadata.current;
-    setSelected(await api.detail(id));
+    setSelected(await catalogApi.detail(id));
   });
   const importPaths = (getPaths:()=>Promise<string[]>,append=false) => action('正在扫描项目',async()=>{
     const paths = await getPaths();
@@ -225,16 +228,16 @@ function App() {
     <span>第 {page+1} 页</span>
     <button disabled={Boolean(busy)||pageLoading||!hasNext} onClick={()=>openPage(page+1)}>下一页</button>
   </div>;
-  const settingsOpen = Boolean(status && (!status.configured || panel==='settings'));
+  const settingsOpen = !web && Boolean(status && (!status.configured || panel==='settings'));
   const toolboxOpen = panel==='toolbox' && Boolean(status?.configured);
   const libraryOpen = !settingsOpen&&!trashOpen&&!toolboxOpen;
   return <div className="shell" onDragOver={event=>{
-    if (status?.configured && !busy && event.dataTransfer.types.includes('Files')) {
+    if (!web && status?.configured && !busy && event.dataTransfer.types.includes('Files')) {
       event.preventDefault();setDragging(true);
     }
   }} onDrop={event=>{
     event.preventDefault();setDragging(false);
-    if(status?.configured&&!busy) {
+    if(!web&&status?.configured&&!busy) {
       const paths = api.pathsForDrop(Array.from(event.dataTransfer.files));
       void importPaths(async()=>paths,Boolean(plan));
     }
@@ -243,13 +246,13 @@ function App() {
       <div className="brand"><span className="brand-mark">✦</span><strong>特效模板库</strong></div>
       <div className="rail-label">工作区</div>
       <button className={libraryOpen?'nav current':'nav'} onClick={()=>{if(trashOpen)openPage(0);setPanel('library');setPlan(undefined);}} disabled={Boolean(busy)||!status?.configured}>▦ <span>全部模板</span></button>
-      <button className={trashOpen?'nav current':'nav'} onClick={()=>{
+      {!web&&<><button className={trashOpen?'nav current':'nav'} onClick={()=>{
         if(!trashOpen)openPage(0);
         setPanel('trash');setPlan(undefined);setSelected(undefined);
       }} disabled={Boolean(busy)||!status?.configured}>⌫ <span>回收站</span></button>
       <button className={settingsOpen?'nav current':'nav'} onClick={()=>{if(trashOpen)openPage(0);setPanel('settings');setPlan(undefined);}} disabled={Boolean(busy)||!status}>⚙ <span>库设置</span></button>
       <button className={toolboxOpen?'nav current':'nav'} onClick={()=>{if(trashOpen)openPage(0);setPanel('toolbox');setPlan(undefined);}}
-        disabled={Boolean(busy)||!status?.configured}>▣ <span>工具箱</span></button>
+        disabled={Boolean(busy)||!status?.configured}>▣ <span>工具箱</span></button></>}
       <div className="rail-label tag-heading">标签</div>
       {available.map(tag=><button className={`nav tag ${activeTags.includes(tag)?'chosen':''}`} key={tag} onClick={()=>{
         if(trashOpen)openPage(0);
@@ -258,15 +261,15 @@ function App() {
         setActiveTags(list=>list.includes(tag)?list.filter(item=>item!==tag):[...list,tag]);
       }} disabled={Boolean(busy)}># <span>{tag}</span></button>)}
       <div className="spacer"/>
-      <button className="nav" disabled={!status||Boolean(busy)} onClick={()=>void action('正在打开日志',()=>api.openLogs())}>≡ <span>运行日志</span></button>
-      <div className="connection"><span className={status?.configured?'online':''}/>{status?.configured?'本地库已连接':'本地库未连接'}</div>
+      {!web&&<button className="nav" disabled={!status||Boolean(busy)} onClick={()=>void action('正在打开日志',()=>api.openLogs())}>≡ <span>运行日志</span></button>}
+      <div className="connection"><span className={status?.configured?'online':''}/>{web?'':'本地'}{status?.configured?'库已连接':'库未连接'}</div>
     </aside>
     <main className="main">
       <header><div className="title">{settingsOpen?'库设置':toolboxOpen?'工具箱':plan?'导入预检':trashOpen?'回收站':'全部模板'}</div>
         {libraryOpen&&!plan&&status?.configured&&<div className="toolbar">
           <input className="search" type="search" aria-label="搜索模板名称或标签" placeholder="搜索模板名称或标签" maxLength={100} value={search} onChange={event=>{setSearch(event.target.value);setPage(0);}}/>
-          <button disabled={Boolean(busy)} onClick={()=>void importPaths(()=>api.pickSource())}>选择文件</button>
-          <button className="primary" disabled={Boolean(busy)} onClick={()=>void folders()}>＋ 导入目录</button>
+          {!web&&<><button disabled={Boolean(busy)} onClick={()=>void importPaths(()=>api.pickSource())}>选择文件</button>
+          <button className="primary" disabled={Boolean(busy)} onClick={()=>void folders()}>＋ 导入目录</button></>}
         </div>}
       </header>
       {error&&<div role="alert" className="banner error">{error}<button onClick={()=>setError('')} aria-label="关闭错误">×</button></div>}
@@ -304,29 +307,29 @@ function App() {
               <button onClick={()=>{setActiveTags([]);setPage(0);}}>清除筛选</button></div>}
           </div>
           {pagination}
-          {pageLoading?<p role="status">正在加载模板…</p>:items.length===0?<div className="empty"><div className="empty-mark">▦</div><h2>{search||activeTags.length?'没有匹配的模板':'导入你的第一套特效模板'}</h2>
-            <p>{search||activeTags.length?'试试更改搜索词或标签。':'把项目目录、HIP、NK 或 MOV 拖到这里。'}</p>
-            {!search&&!activeTags.length&&<button className="primary" disabled={Boolean(busy)} onClick={()=>void folders()}>选择项目目录</button>}
+          {pageLoading?<p role="status">正在加载模板…</p>:items.length===0?<div className="empty"><div className="empty-mark">▦</div><h2>{search||activeTags.length?'没有匹配的模板':web?'暂无已发布的模板':'导入你的第一套特效模板'}</h2>
+            {search||activeTags.length?<p>试试更改搜索词或标签。</p>:!web&&<p>把项目目录、HIP、NK 或 MOV 拖到这里。</p>}
+            {!web&&!search&&!activeTags.length&&<button className="primary" disabled={Boolean(busy)} onClick={()=>void folders()}>选择项目目录</button>}
           </div>:<TemplateGrid items={items} selected={selected?.id} disabled={Boolean(busy)}
             zoom={cardZoom} onZoom={changeCardZoom} open={id=>void open(id)}/>}
         </section>
         {selected&&<Detail key={selected.id} item={selected} working={Boolean(busy)} close={()=>setSelected(undefined)}
-          openDirectory={()=>void action('正在打开模板目录',()=>api.openTemplateDirectory(selected.id))}
+          openDirectory={web?undefined:()=>void action('正在打开模板目录',()=>api.openTemplateDirectory(selected.id))}
           setTags={tags=>saveMetadata('标签',async()=>{
-            await api.updateTags(selected.id,tags);
+            await catalogApi.updateTags(selected.id,tags);
             setRevision(value=>value+1);
-            const stored = await api.detail(selected.id);
+            const stored = await catalogApi.detail(selected.id);
             setSelected(current=>current?.id===stored.id ? {...current,tags:stored.tags} : current);
           })}
           setDescription={description=>saveMetadata('描述',async()=>{
-            await api.updateDescription(selected.id,description);
+            await catalogApi.updateDescription(selected.id,description);
             setSelected(current=>current?.id===selected.id ? {...current,description} : current);
           })}
           exportPackage={mode=>void action('正在保存模板包',async()=>{
-            const file=await api.export(selected.id,mode);
+            const file=await catalogApi.export(selected.id,mode);
             if(file)setNotice(`模板包已保存 · ${file}`);
           })}
-          moveToTrash={()=>void action('正在移入回收站',async()=>{
+          moveToTrash={web?undefined:()=>void action('正在移入回收站',async()=>{
             await pendingMetadata.current;
             await api.trash(selected.id);
             setItems(list=>list.filter(item=>item.id!==selected.id));setSelected(undefined);
@@ -334,6 +337,7 @@ function App() {
           })}/>}
       </div>}
       {!status&&!error&&<div className="empty" role="status">正在启动模板库…</div>}
+      {web&&status&&!status.configured&&<div className="empty" role="status">模板库暂未连接，请联系管理员。</div>}
     </main>
     {dragging&&<div className="drop-layer" onDragLeave={()=>setDragging(false)}><div>{plan?'释放以添加到本次导入':'释放以扫描项目'}</div></div>}
   </div>;
@@ -401,7 +405,7 @@ function TemplateGrid({items,selected,disabled,zoom,onZoom,open}:{
     {items.map(item=><button className={`card ${selected===item.id?'selected':''}`} data-template-id={item.id}
       key={item.id} onClick={()=>open(item.id)} disabled={disabled}>
       <div className="tile">
-        {foreground&&visibility?.items===items&&visibility.ids.has(item.id)&&<TemplateVideo src={`vfx-media://preview/${item.id}`}/>}
+        {foreground&&visibility?.items===items&&visibility.ids.has(item.id)&&<TemplateVideo src={previewUrl(item.id)}/>}
       </div>
       <div className="card-info"><strong>{item.title}</strong><span>{item.tags.slice(0,4).join(' · ')||`${item.files} 个文件`}</span></div>
     </button>)}
@@ -789,9 +793,11 @@ function ImportView({plan,working,close,addFolders,addFiles,publish}:{
 function Detail({item,working,close,setTags,setDescription,exportPackage,moveToTrash,openDirectory}:{
   item:TemplateDetail;working:boolean;close:()=>void;setTags:(tags:string[])=>Promise<boolean>;
   setDescription:(description:string)=>Promise<boolean>;
-  exportPackage:(mode:'slim'|'full')=>void;moveToTrash:()=>void;openDirectory:()=>void;
+  exportPackage:(mode:'slim'|'full')=>void;moveToTrash?:()=>void;openDirectory?:()=>void;
 }) {
   const descriptionId = useId();
+  const directoryId = useId();
+  const directory = useRef<HTMLDialogElement>(null);
   const [tagDraft,setTagDraft] = useState('');
   const [descriptionDraft,setDescriptionDraft] = useState(item.description);
   const [savingTags,setSavingTags] = useState(false);
@@ -820,8 +826,8 @@ function Detail({item,working,close,setTags,setDescription,exportPackage,moveToT
 
   return <aside className="detail">
     <div className="detail-head"><h2>{item.title}</h2><button onClick={close} aria-label="关闭模板详情">×</button></div>
-    <TemplateVideo src={`vfx-media://preview/${item.id}`} controls onError={()=>setMediaError(true)}/>
-    {mediaError&&<p className="warning">当前桌面播放器无法预览此 MOV，可通过模板包打开原文件。</p>}
+    <TemplateVideo src={previewUrl(item.id)} controls onError={()=>setMediaError(true)}/>
+    {mediaError&&<p className="warning">当前{web?'浏览器':'桌面播放器'}无法预览此 MOV，可通过模板包打开原文件。</p>}
     <div className="detail-fields">
       <TagField tags={item.tags} draft={tagDraft} disabled={working||savingTags}
         onTags={(tags,submitted)=>void updateTags(tags,submitted)} onDraft={setTagDraft}/>
@@ -836,23 +842,31 @@ function Detail({item,working,close,setTags,setDescription,exportPackage,moveToT
       </label>
     </div>
     <div className="toolbar detail-actions">
-      <button disabled={working} onClick={openDirectory}>打开模板目录</button>
+      <button disabled={working} onClick={openDirectory??(()=>directory.current?.showModal())}>打开模板目录</button>
       <button disabled={working} onClick={()=>exportPackage('slim')}>导出精简包</button>
       <button className="primary" disabled={working} onClick={()=>exportPackage('full')}>导出完整模板</button>
     </div>
+    {web&&<dialog className="template-directory" aria-labelledby={directoryId} ref={directory}>
+      <div className="detail-head"><h2 id={directoryId}>模板目录</h2>
+        <form method="dialog"><button aria-label="关闭模板目录">×</button></form></div>
+      <p className="muted">project/</p>
+      <ul>{item.manifest.map(file=><li key={file.path}>{file.entries?.length
+        ? <details><summary>{file.path}</summary><ul>{file.entries.map(entry=><li key={entry.path}>{entry.path}</li>)}</ul></details>
+        : file.path}</li>)}</ul>
+    </dialog>}
     {archives.length>0&&<p className="muted">使用素材前，请将 {archives.join('、')} 解压到工程目录。</p>}
     <dl className="detail-meta">
       <div><dt>发布时间</dt><dd><time dateTime={item.publishedAt}>{publicationTime.format(new Date(item.publishedAt))}</time></dd></div>
       <div><dt>文件数量</dt><dd>{item.files} 个</dd></div>
       <div><dt>总大小</dt><dd>{bytes(item.bytes)}</dd></div>
     </dl>
-    {confirmTrash?<section className="trash-action">
+    {moveToTrash&&(confirmTrash?<section className="trash-action">
       <p>将「{item.title}」移入回收站？之后可以恢复。</p>
       <div className="toolbar">
         <button disabled={working} onClick={()=>setConfirmTrash(false)}>取消</button>
         <button className="danger" disabled={working} onClick={moveToTrash}>确认移入</button>
       </div>
-    </section>:<button className="danger trash-action" disabled={working} onClick={()=>setConfirmTrash(true)}>移入回收站</button>}
+    </section>:<button className="danger trash-action" disabled={working} onClick={()=>setConfirmTrash(true)}>移入回收站</button>)}
   </aside>;
 }
 
